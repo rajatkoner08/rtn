@@ -1,0 +1,47 @@
+coco >>> False
+ckpt >>> 
+det_ckpt >>> 
+save_dir >>> 
+num_gpus >>> 3
+num_workers >>> 1
+lr >>> 0.001
+batch_size >>> 2
+num_run >>> 0
+val_size >>> 5000
+l2 >>> 0.0001
+clip >>> 5.0
+print_interval >>> 100
+mode >>> sgdet
+model >>> motifnet
+old_feats >>> False
+use_bg >>> False
+cache >>> 
+gt_box >>> False
+adam >>> False
+test >>> False
+multi_pred >>> False
+num_epochs >>> 25
+use_resnet >>> False
+use_proposals >>> False
+nl_obj >>> 2
+nl_edge >>> 2
+fwd_dim >>> 2048
+pos_dim >>> 128
+attn_dim >>> 512
+bert_embd_dim >>> 512
+feature_dim >>> 512
+n_head >>> 8
+max_token_seq_len >>> 64
+pooling_dim >>> 4096
+pass_in_obj_feats_to_decoder >>> False
+pass_in_obj_feats_to_edge >>> False
+dropout >>> 0.1
+use_bias >>> False
+require_overlap_det >>> False
+highlight_sub_obj >>> False
+obj_index_enc >>> False
+proj_share_weight >>> True
+embs_share_weight >>> True
+use_tanh >>> False
+use_bg_rels >>> False
+limit_vision >>> False
