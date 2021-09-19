@@ -33,7 +33,8 @@ This version is trained on [Pytorch 0.4](https://pytorch.org/get-started/previou
 
 # Training 
 For training :```CUDA_VISIBLE_DEVICES=0 HDF5_USE_FILE_LOCKING=FALSE python models/train_rels.py -m predcls -nl_obj 3 -nl_edge 2 -attn_dim 2048 -ngpu 1 -ckpt Your_Checkpoint_Path -save_dir Your_Save_Dir -nepoch 30 -obj_index_enc -highlight_sub_obj -n_head 12 -b 20 -dropout 0.25 -l2 1e-5 -lr 5e-2 -normalized_roi -use_union_boxes -spo spo -use_extra_pos -train_obj_roi```
-#Evaluation
+
+# Evaluation
 For evaluation on VG (also you can download pre-trained weight of [RTN](https://syncandshare.lrz.de/getlink/fi8Q3pMt6yPo4J1w5fbpSUEn/) ): 
 ```CUDA_VISIBLE_DEVICES=0 HDF5_USE_FILE_LOCKING=FALSE python models/eval_rels.py -m predcls -nl_obj 3 -nl_edge 2 -attn_dim 2048 -ngpu 1 -ckpt ckpt_path -obj_index_enc -highlight_sub_obj -n_head 12 -b 10 -normalized_roi -use_union_boxes -spo spo -use_extra_pos -train_obj_roi -pooling_dim 4096 -use_gap -use_word_emb -use_bias -test -save_dir data/checkpoints```
 
