@@ -10,25 +10,25 @@ import torch.nn.parallel
 from torch.nn import functional as F
 from lib.pytorch_misc import enumerate_by_image,append_and_pad, get_feats_size, get_index_pos
 from lib.resnet import resnet_l4
-from config import BATCHNORM_MOMENTUM, DETECTOR_CONF
+from config import BATCHNORM_MOMENTUM, DETECTOR_CONF, NumAttr
 
 from lib.transformer.Models import Encoder, Decoder, Rel
 from lib.fpn.box_utils import draw_obj_box
 from lib.pytorch_misc import get_obj_comb_by_batch, init_weights
 from lib.relation_prediction import Relation_Prediction
-from lib.fpn.box_utils import bbox_overlaps, center_size
+from lib.fpn.box_utils import bbox_overlaps, center_size, increase_relative_size
 from lib.get_union_boxes import UnionBoxesAndFeats
 from lib.fpn.proposal_assignments.rel_assignments import rel_assignments
 from lib.object_detector import ObjectDetector, gather_res, load_vgg
 from lib.pytorch_misc import make_one_hot, get_normalized_rois, to_onehot, get_combined_feats, Flattener
-from lib.sparse_targets import FrequencyBias
+#from lib.sparse_targets import FrequencyBias
 from lib.surgery import filter_dets
 from lib.helper import get_fwd_inv_rels
 from lib.word_vectors import obj_edge_vectors
-from lib.fpn.roi_align.functions.roi_align import RoIAlignFunction
-#from torchvision.ops.roi_align import roi_align as RoIAlignFunction # for pytorch 1.4
+from torchvision.ops.roi_align import roi_align as RoIAlignFunction
 
 from lib.draw_attention import process_node_edge_map, process_obj_attn_map, process_edge_attn_map
+import copy
 
 MODES = ('sgdet', 'sgcls', 'predcls')
 
@@ -38,9 +38,8 @@ class LinearizedContext(nn.Module):
     Module for computing the object contexts and edge contexts
     """
     def __init__(self, classes, rel_classes, config, mode='sgdet',
-                 hidden_dim=256, obj_dim=2048,dim =512,
-                 nl_obj=2, nl_edge=2, dropout_rate=0.2, use_temporal_conn=True, proj_share_weight = True,
-                 embs_share_weight = True, dropout = 0.1):
+                 hidden_dim=256, nl_obj=2, nl_edge=2, dropout_rate=0.2, use_temporal_conn=True, proj_share_weight = True,
+                 embs_share_weight = True, dropout = 0.1, gap_dim=512):
         super(LinearizedContext, self).__init__()
         self.classes = classes
         self.rel_classes = rel_classes
@@ -52,7 +51,6 @@ class LinearizedContext(nn.Module):
 
         self.nl_obj = config.nl_obj
         self.nl_edge = config.nl_edge
-        self.obj_dim = obj_dim
         self.pooling_dim = config.pooling_dim
         self.pos_dim = config.pos_dim
         self.normalized_roi = config.normalized_roi
@@ -67,7 +65,6 @@ class LinearizedContext(nn.Module):
         self.use_sub_obj_index = config.highlight_sub_obj
         self.use_nm_baseline = config.use_nm_baseline
         self.dropout = nn.Dropout(config.dropout)
-        self.seperate_edge = config.seperate_edge
         self.e2e = config.edge2edge_attn
         self.pass_obj_dist = config.pass_obj_dist
         self.attn4rel = config.use_obj_rel_map
@@ -75,6 +72,9 @@ class LinearizedContext(nn.Module):
         self.use_extra_pos = config.use_extra_pos
         self.comb_edge = config.comb_edge
         self.use_gap = config.use_gap
+        self.attr = config.use_attr
+        self.lrelu = nn.LeakyReLU()
+        self.sigmoid = nn.Sigmoid() # initialize sigmoid layer
 
         #assert (self.use_word_emb == True and self.pass_obj_dist ==False),'Pass obj dist only if word embedding is used' #todo use proper assert
         if self.spatial_box:
@@ -101,7 +101,7 @@ class LinearizedContext(nn.Module):
             self.obj_embed2.weight.requires_grad = False
             self.obj_embed2.weight.data = embed_vecs.clone()
 
-        self.layer_norm= nn.LayerNorm(config.attn_dim)
+        #self.layer_norm= nn.LayerNorm(config.attn_dim)
         if self.edge_loss:
             assert self.hidden_dim == config.attn_dim #todo check compatibility wd above similar assigment
             self.correct_edge = nn.Sequential(*[nn.Linear(self.hidden_dim, 1),nn.Sigmoid()]) #nn.Linear(self.hidden_dim+config.attn_dim, self.hidden_dim),nn.Dropout(dropout_rate),
@@ -112,7 +112,8 @@ class LinearizedContext(nn.Module):
             self.avg_pool = torch.nn.AvgPool2d(kernel_size=37)  # todo replcae wd correct param
 
         # determine feature dimension
-        node_dim, edge_dim = get_feats_size(self.pooling_dim, self.use_word_emb, self.normalized_roi, self.union_boxes, self.use_extra_pos, self.spatial_box, use_gap=self.use_gap)
+        node_dim, edge_dim = get_feats_size(self.pooling_dim, self.use_word_emb, self.normalized_roi, self.union_boxes, self.spatial_box, use_gap=self.use_gap,
+                                            gap_dim=gap_dim, num_classes=self.num_classes)
         self.compress_node = nn.Linear(node_dim, config.attn_dim)
         torch.nn.init.xavier_normal(self.compress_node.weight, gain=1.0)
         if node_dim == edge_dim:
@@ -130,12 +131,7 @@ class LinearizedContext(nn.Module):
             ])
         else:
             self.pos_embed = None
-        # self.pos_embed2 = nn.Sequential(*[
-        #         nn.BatchNorm1d(8, momentum=BATCHNORM_MOMENTUM / 10.0),
-        #         nn.Linear(8, 128),
-        #         nn.ReLU(inplace=True),
-        #         nn.Dropout(0.1),
-        #     ])
+
         # whether to pass object detector features along with context
         if self.pass_obj_feats_to_classifier :
             self.obj_out = nn.Linear(self.pooling_dim + config.attn_dim, self.num_classes)
@@ -143,14 +139,13 @@ class LinearizedContext(nn.Module):
             self.obj_out = nn.Linear(config.attn_dim, self.num_classes)
         torch.nn.init.xavier_normal(self.obj_out.weight, gain=1.0)
 
+        #for attribute classification
+        if self.attr:
+            self.attr_linear = nn.Linear(config.attn_dim + self.num_classes + NumAttr, NumAttr) # + NumAttr todo attribute change here
+
         if self.use_nm_baseline:
             self.decoder_lin = nn.Linear(self.pooling_dim + self.embed_dim + 128, self.num_classes)
 
-        if self.use_background:  #todo fix bg for all cases
-            self.compress_bg_feats = nn.Linear((11*11*512)+ len(classes) + 128, config.attn_dim)
-            self.compress_bg_feats.weight = torch.nn.init.xavier_normal(self.compress_bg_feats.weight, gain=1.0)
-            self.compress_bg_feats.bias.data.zero_()
-            self.bg_flat_feats = nn.Sequential(*[torch.nn.MaxPool2d(7, stride=3), Flattener()])
 
         if self.nl_obj > 0:
             self.obj_ctx_enc = Encoder(self.num_classes, max_seq=self.max_positional_obj+1, d_word_vec=config.attn_dim,
@@ -173,7 +168,8 @@ class LinearizedContext(nn.Module):
     @property
     def num_rels(self):
         return len(self.rel_classes)
-    def forward(self, bg_fmap, obj_fmaps, obj_logits, obj_comb, im_inds, obj_labels=None, box_priors=None, boxes_per_cls=None, src_seq=None, tgt_seq=None, index_enc=None, norm_boxes=None,  union_boxes_feats = None, u_rois=None, return_attn=True):
+    def forward(self, bg_fmap, obj_fmaps, obj_logits, obj_comb, im_inds, obj_labels=None, box_priors=None, boxes_per_cls=None, src_seq=None, tgt_seq=None, index_enc=None,
+                norm_boxes=None,  union_boxes_feats = None, u_rois=None, attir=None, od_atrr_dists=None, return_attn=True):
         """
         Forward pass through the object and edge context
         :param obj_priors:
@@ -205,7 +201,7 @@ class LinearizedContext(nn.Module):
         if self.use_gap:
             gap_feats = self.avg_pool(bg_fmap).view(bg_fmap.shape[0], -1)[im_inds]
         obj_combined_feats = get_combined_feats(obj_fmaps, obj_word_embed, pos_feats, self.compress_node, self.normalized_roi, self.pos_embed,
-                                                self.dropout(obj_embed) if self.pass_obj_dist else  None, use_spatial=self.use_extra_pos, gap=gap_feats if self.use_gap else None)
+                                                self.dropout(obj_embed) if self.pass_obj_dist else  None, spatial_box=self.spatial_box, gap=gap_feats if self.use_gap else None)
         obj_index = None
 
         src_seq = src_seq[:, 1].view(self.batch_size, src_seq.shape[0] // self.batch_size)
@@ -214,16 +210,6 @@ class LinearizedContext(nn.Module):
 
         if self.use_obj_index:
             obj_index = get_index_pos(src_seq)
-
-        if self.use_background: # todo break for norm box
-            bg_feats = self.bg_flat_feats(bg_fmap) #todo experiemnt BG wodut coordinate, later delete
-            bg_class = make_one_hot(torch.zeros(bg_feats.shape[0],1), self.num_classes)
-            bg_pos = self.pos_embed(center_size(norm_boxes[:, 1].view(self.batch_size, 4)))
-            bg_combined_feats = self.compress_bg_feats(torch.cat((bg_feats, bg_class, bg_pos),1))
-            enc_obj_feats = torch.cat((enc_obj_feats, bg_combined_feats.unsqueeze(1)),1)
-            src_seq = torch.cat((src_seq, torch.ones(bg_feats.shape[0],1).long().cuda()),1)
-            if self.use_obj_index:
-                obj_index = torch.cat((obj_index, torch.cuda.LongTensor([obj_index.shape[1]+1]).repeat(obj_index.shape[0],1)),1)
 
         #call multi head attn Encoder, attn map not used now, later on u can
         enc_rep, obj_self_attn = self.obj_ctx_enc(enc_obj_feats, src_seq, obj_index, return_attns=return_attn)  #todo removed slf attn to use attn4rel, later decide
@@ -240,23 +226,27 @@ class LinearizedContext(nn.Module):
             flattend_enc_rep = enc_rep.view(enc_rep.shape[0] * enc_rep.shape[1], -1)
 
         obj_dists = self.obj_out(torch.cat((obj_fmaps, flattend_enc_rep), 1) if self.pass_obj_feats_to_classifier else flattend_enc_rep)
-        obj_preds = obj_dists.max(1)[1]
+        obj_preds = obj_logits.max(1)[1]
 
-        # combine all (obj1,obj2) to get predicate feature try both obj_feats and enc_out
+        #for attribute classification todo  for attribute change here
+        if self.attr:
+            attr_dist = self.sigmoid(self.attr_linear(torch.cat((flattend_enc_rep[attir[:,1]], obj_dists[attir[:, 1]], F.sigmoid(od_atrr_dists[attir[:,1]])), 1)))#
+        else:
+            attr_dist = None
 
         # Now use the actual class
-        if (self.training and not self.mode =='sgdet' ) or self.mode=='predcls' :  #todo change,
+        if self.mode=='predcls' :
                 assert obj_labels is not None
                 obj_preds = obj_labels
                 obj_embed2 = self.obj_embed2(obj_labels) if self.use_word_emb else to_onehot(obj_labels,self.num_classes)
-        elif self.use_word_emb:
+        elif self.use_word_emb: #todo change,
                 obj_embed2 = self.obj_embed2(obj_preds)
         else:
             obj_embed2 = obj_dists
 
         pred_feats = get_combined_feats(union_boxes_feats if self.union_boxes else obj_fmaps, self.dropout(obj_embed2), u_rois[:,1:] if self.union_boxes else pos_feats,
                                         self.compress_edge, self.normalized_roi, self.pos_embed, self.dropout(obj_embed) if self.pass_obj_dist else  None,
-                                        obj_comb, edge=True, union=self.union_boxes, use_spatial=self.use_extra_pos)
+                                        obj_comb, edge=True, union=self.union_boxes, spatial_box=self.spatial_box)
 
         if not self.union_boxes and self.use_extra_pos : #todo experiemnt with +/*/-
             pred_feats += union_boxes_feats
@@ -286,14 +276,14 @@ class LinearizedContext(nn.Module):
         else:
             edge_out = None
 
-        return obj_dists, obj_preds, flattend_enc_rep, edge_ctx.view(-1, self.hidden_dim), obj_self_attn, edge_self_attn, edge_node_attn,edge_out
+        return obj_dists, obj_preds, flattend_enc_rep, edge_ctx.view(-1, self.hidden_dim), obj_self_attn, edge_self_attn, edge_node_attn, edge_out, attr_dist
 
 
 class TransformerModel(nn.Module):
     """
     RELATIONSHIPS
     """
-    def __init__(self, classes, rel_classes, config, filenames=None, save_attn = False):
+    def __init__(self, classes, rel_classes, config, filenames=None, save_attn = False, inference=False):
 
         """
         :param classes: Object classes
@@ -318,23 +308,28 @@ class TransformerModel(nn.Module):
         self.drout = config.dropout
         self.b_dropout = nn.Dropout(2*self.drout)
         self.use_gap = False# todo  fix this laterconfig.use_gap
+        self.eval_method =config.eval_method
+        self.use_attr = config.use_attr
 
         self.filenames = filenames
         self.save_attn = save_attn
         self.counter = 0
         self.pooling_size = 7
+        self.pool_dim = config.pooling_dim
         self.hidden_dim = config.attn_dim
-        self.obj_dim = 2048 if config.use_resnet else 4096
+        self.use_mmdet = config.use_mmdet
         self.fwd_dim = config.fwd_dim
         self.use_union_boxes = config.union_boxes
         self.spo = config.spo
         self.focal_loss = config.use_FL
         self.edge_loss = config.use_valid_edges
+        self.use_extra_pos = config.use_extra_pos
+        self.refine_obj = config.refine_obj
 
         self.use_bias = config.use_bias
         self.use_norm_boxes = config.normalized_roi
         self.use_tanh = config.use_tanh
-        #self.PReLU = nn.PReLU()
+        self.inference = inference
         self.require_overlap = config.require_overlap_det #and self.mode == 'sgdet'  #todo check if sgdet is needed
 
         @property
@@ -349,16 +344,21 @@ class TransformerModel(nn.Module):
             use_resnet=config.use_resnet,
             thresh=DETECTOR_CONF,
             max_per_img=64,
+            use_mmdet=config.use_mmdet,
+            mmdet_config=config.mmdet_config,
+            mmdet_ckpt=config.ckpt,
         )
 
-        self.context = LinearizedContext(self.classes, self.rel_classes, config, mode=self.mode)
+        self.context = LinearizedContext(self.classes, self.rel_classes, config, mode=self.mode, gap_dim=4096 if config.use_mmdet else 512)
 
-        # Image Feats (You'll have to disable if you want to turn off the features from here)
-        if self.use_union_boxes or self.use_extra_pos:
-            self.union_boxes = UnionBoxesAndFeats(pooling_size=self.pooling_size, stride=16,
-                                              dim=1024 if config.use_resnet else 512, batch_size=self.batch_size, use_uimg_feats=self.use_union_boxes, fwd_dim=self.hidden_dim)
-
-        if config.use_resnet:
+        if config.use_mmdet:
+            self.roi_fmap_obj = nn.Sequential(*[nn.Linear(3072,self.pool_dim),nn.Dropout(0.5),nn.ReLU(inplace=True)]) #nn.Conv1d(3*256,256, kernel_size=(1,1)) #for cascade rcnn the number of stage is 3 and out chanel 256
+            self.roi_fmap_obj.apply(init_weights)
+            if self.use_union_boxes:     #used for union boxes
+                #self.reduce_dim = copy.deepcopy(self.reduce_dim_obj)
+                self.roi_extractor = copy.deepcopy(self.detector.roi_fmap)
+                self.roi_fmap =copy.deepcopy(self.roi_fmap_obj)
+        elif config.use_resnet:
             self.roi_fmap = nn.Sequential(
                 resnet_l4(relu_end=False),
                 nn.AvgPool2d(self.pooling_size),
@@ -366,7 +366,7 @@ class TransformerModel(nn.Module):
             )
         else: #todo there is an extra roi fmap in detector, check how heavy or large it is
             if self.use_union_boxes:     #used for union boxes
-                # self.roi_fmap = nn.Sequential(*[nn.Linear(512*7*7, 4096),nn.BatchNorm1d(4096, momentum=BATCHNORM_MOMENTUM),nn.ReLU(inplace=True), nn.Linear(4096,4096), nn.Dropout(0.5)])
+                # self.roi_fmap = nn.Sequential(*[nn.Linear(512*7*7, 4096),nn.ReLU(inplace=True), nn.Linear(4096,4096), nn.Dropout(0.5),nn.ReLU(inplace=True)])
                 # self.roi_fmap.apply(init_weights)
                 roi_fmap = [
                     Flattener(),
@@ -378,6 +378,15 @@ class TransformerModel(nn.Module):
             self.roi_fmap_obj = load_vgg(pretrained=False).classifier
 
         ###################################
+
+        # Image Feats (You'll have to disable if you want to turn off the features from here)
+        if self.use_union_boxes or self.use_extra_pos:
+            self.union_boxes = UnionBoxesAndFeats(pooling_size=self.pooling_size, stride=16,
+                                                  dim=256 if config.use_mmdet else 512, batch_size=self.batch_size,
+                                                  use_uimg_feats=self.use_union_boxes, fwd_dim=self.hidden_dim,
+                                                  pool_dim=config.pooling_dim, mmdet=self.use_mmdet,
+                                                  roi_extractor=self.roi_extractor, roi_fmap = self.roi_fmap )#reduce_dim = self.reduce_dim if self.use_mmdet else None
+
         self.nl_edge = config.nl_edge
 
         #init relation prediction module
@@ -405,29 +414,17 @@ class TransformerModel(nn.Module):
         :return: score_pred, a [num_rois, num_classes] array
                  box_pred, a [num_rois, num_classes, 4] array
         """
+
         assert pair_inds.size(1) == 3
         uboxes, u_rois, s_o_rois, o_s_rois = self.union_boxes(features, rois, pair_inds, use_norm_boxes, im_sizes, tgt_seq)
-        if self.use_union_boxes:
-            return self.roi_fmap(uboxes.view(uboxes.shape[0],-1)), u_rois, s_o_rois, o_s_rois   #todo also experiment with vgg classifiar
+        if self.use_union_boxes and not self.use_mmdet:
+            return self.roi_fmap(uboxes), u_rois, s_o_rois, o_s_rois
         else:
             return uboxes, u_rois, s_o_rois, o_s_rois
         #return uboxes.view(uboxes.size(0),-1), u_rois
 
-    def obj_feature_map(self, features, rois):  #todo there is another same function in od
-        """
-        Gets the ROI features
-        :param features: [batch_size, dim, IM_SIZE/4, IM_SIZE/4] (features at level p2)
-        :param rois: [num_rois, 5] array of [img_num, x0, y0, x1, y1].
-        :return: [num_rois, #dim] array
-        """
-        # for pytorch 1.4
-        # feature_pool = RoIAlignFunction(features, rois,
-        #                  output_size=[self.pooling_size, self.pooling_size], spatial_scale=1 / 16, sampling_ratio=0)
-        feature_pool = RoIAlignFunction(self.pooling_size, self.pooling_size, spatial_scale=1 / 16)(
-            features, rois)
-        return self.roi_fmap_obj(feature_pool.view(rois.size(0), -1))
 
-    def get_rel_inds(self, im_inds, box_priors, gt_rels, mode):
+    def get_rel_inds(self, im_inds, box_priors, gt_rels, mode, im_sizes):
         # Get the possible object combination and relation from batch
 
         im_inds_batchwise = im_inds.view(self.batch_size, im_inds.shape[0] // self.batch_size).data.cpu().numpy()
@@ -441,12 +438,12 @@ class TransformerModel(nn.Module):
         fwd_rels_all = []
         inv_rels_all = []
         max_seq = 0
-        for i, (im_ind, boxes) in enumerate(zip(im_inds_batchwise, box_priors_batchwise)):
+        for i, (im_ind, boxes, im_size) in enumerate(zip(im_inds_batchwise, box_priors_batchwise, im_sizes)):
             valid_seq = np.max(np.where(box_priors_batchwise[i].any(axis=1)))+1 #as index start from 0
             if valid_seq > max_seq:
                 max_seq = valid_seq
 
-            if mode in ('predcls', 'sgcls'):#:
+            if mode in ('predcls', 'sgcls') and self.eval_method=='gt':#:
                 gt_rels_image = gt_rels_np[np.where(gt_rels_np[:, 0] == i), :][0, :, :]
                 possible_obj_comb = np.unique(np.sort(gt_rels_image[:, 1:3], axis=1), axis=0)
                 possible_obj_comb, fwd_rels, inv_rels = get_fwd_inv_rels(possible_obj_comb, gt_rels_image[:,1:], val=True)
@@ -455,15 +452,16 @@ class TransformerModel(nn.Module):
                 np.fill_diagonal(possible_obj_comb, 0)
 
                 # Require overlap for detection
-
+                if self.eval_method=='increase_overlap':
+                    boxes = increase_relative_size(boxes, im_size[1], im_size[0], relative_per=0.1)
                 boxes_iou = (bbox_overlaps(boxes[:valid_seq, :], boxes[:valid_seq, :]) > 0)
                 inv_boxes_iou = np.invert(boxes_iou) #non overlap edge
                 np.fill_diagonal(inv_boxes_iou, False)
                 non_overlap_edge = np.argwhere(np.triu(inv_boxes_iou))
                 np.fill_diagonal(boxes_iou, False)
                 overlap_edge = np.argwhere(np.triu(boxes_iou))
-                if overlap_edge.shape[0]< 150 and mode in ('predcls', 'sgcls'):
-                    numOfSample = min(150-len(overlap_edge),len(non_overlap_edge))
+                if overlap_edge.shape[0]< 400 and mode in ('predcls', 'sgcls'):
+                    numOfSample = min(400-len(overlap_edge),len(non_overlap_edge))
                     non_overlap_edge = random.sample(list(non_overlap_edge),k=numOfSample)
                     if len(non_overlap_edge)>0:
                         possible_obj_comb = np.unique(np.concatenate((overlap_edge,non_overlap_edge),0),axis=0)
@@ -493,7 +491,7 @@ class TransformerModel(nn.Module):
         return append_and_pad(batch_size=self.batch_size, im_inds=im_inds, obj_comb = obj_comb_all, fwd_rel = fwd_rels_all, inv_rel = inv_rels_all, src_seq= src_seq_all, tgt_seq = tgt_seq_all)
 
     def forward(self, x, im_sizes, image_offset, gt_boxes=None, gt_classes=None, src_seq=None, tgt_seq=None, gt_rels=None, proposals=None, gt_obj_comb=None,
-                fwd_rels = None, inv_rels = None, train_anchor_inds=None, obj_comb_pos = None, norm_boxes=None, obj_rel_mat = None, return_fmap=False):
+                fwd_rels = None, inv_rels = None, train_anchor_inds=None, obj_comb_pos = None, norm_boxes=None, obj_rel_mat = None, gt_attr =None, return_fmap=False):
         """
         Forward pass for detection
         :param x: Images@[batch_size, 3, IM_SIZE, IM_SIZE]
@@ -515,13 +513,22 @@ class TransformerModel(nn.Module):
         """
 
         result = self.detector(x, im_sizes, image_offset, gt_boxes, gt_classes, gt_rels, proposals, gt_obj_comb[:,:3].clone(), train_anchor_inds, return_fmap=True)
+        assert not result.is_nan()
         result.edge_gt_lbl = gt_obj_comb[:,3]  #gt_obj_comb[torch.nonzero(gt_obj_comb[:,3])] #todo not gonna work wd sgdet
+        if isinstance(result.fmap, list):
+            result.fmap = [i.detach() for i in result.fmap]
+            # temporarily take the first layer
+            #result.fmap = [result.fmap[0]]
+        else:
+            result.fmap = result.fmap.detach()
 
         if result.is_none():
             return ValueError("heck")
 
         im_inds = result.im_inds - image_offset
         boxes = result.rm_box_priors
+        result.od_attrs = gt_attr
+        gt_attr_index = gt_attr[:,:2].float()
 
         if self.training and  self.mode == 'sgdet':  #todo chage for sgdet
             result.rel_labels = rel_assignments(im_inds.data, boxes.data, result.rm_obj_labels.data,
@@ -531,29 +538,27 @@ class TransformerModel(nn.Module):
 
         rois = torch.cat((im_inds[:, None].float(), boxes), 1)
 
-        result.obj_fmap = self.obj_feature_map(result.fmap.detach(), rois)
-
+        proj_obj_fmap = self.roi_fmap_obj(result.obj_fmap) #self.reduce_dim_obj(result.obj_fmap).view(result.obj_fmap.shape[0],-1))
         if not self.training : #and result.obj_comb is None
-           fwd_rels, inv_rels, src_seq, tgt_seq, gt_obj_comb = self.get_rel_inds(im_inds, result.rm_box_priors, gt_rels, self.mode)  #todo need to match if edge loss is there, either here or sg_eval
+           fwd_rels, inv_rels, src_seq, tgt_seq, gt_obj_comb = self.get_rel_inds(im_inds, result.rm_box_priors, gt_rels, self.mode, im_sizes)  #todo need to match if edge loss is there, either here or sg_eval
             #fwd_rels = fwd_rels[:,:4]
             #inv_rels = inv_rels[:,:4]
             #gt_obj_comb = gt_obj_comb[:,:3]   #todo temp code, remove
 
-        # compute fwd and inv edges, also take care of multiple occurrences of a single edge
-        # todo check for padding if this remains ok and add another FC after all_pred
-        result.obj_comb, fwd_rels, inv_rels = get_obj_comb_by_batch(gt_obj_comb[:,:3].clone(), im_inds, fwd_rels, inv_rels)
+        # compute fwd and inv edges, also take care of multiple occurrences of a single edge, attribute with enumenrate by image
+        result.obj_comb, fwd_rels, inv_rels, result.od_attrs = get_obj_comb_by_batch(gt_obj_comb[:,:3].clone(), im_inds, fwd_rels, inv_rels, result.od_attrs)
         #fwd_rels = fwd_rels[torch.nonzero(fwd_rels[:, 4])]
         #inv_rels = inv_rels[torch.nonzero(inv_rels[:,4])]
 
         if self.use_union_boxes or self.use_extra_pos:
-            vr, u_rois, s_o_rois, o_s_rois = self.visual_rep(result.fmap.detach(), rois, result.obj_comb, self.use_norm_boxes, im_sizes, tgt_seq) #todo u_roi will break in norm_boxes used
+            vr, u_rois, s_o_rois, o_s_rois = self.visual_rep(result.fmap, rois, result.obj_comb, self.use_norm_boxes, im_sizes, tgt_seq) #todo u_roi will break in norm_boxes used
 
         # Prevent gradients from flowing back into score_fc from elsewhere
-        result.rm_obj_dists, result.obj_preds, obj_ctx, edge_ctx, obj_self_attn, edge_self_attn, edge_node_attn, result.edge_dist = self.context(
-            result.fmap, result.obj_fmap, result.rm_obj_dists.detach(), result.obj_comb,
+        result.rm_obj_dists, result.obj_preds, obj_ctx, edge_ctx, obj_self_attn, edge_self_attn, edge_node_attn, result.edge_dist, result.attr_dist = self.context(
+            result.fmap, proj_obj_fmap, result.rm_obj_dists.detach(), result.obj_comb,
             im_inds, result.rm_obj_labels if self.training or self.mode == 'predcls' else None,  #todo here predcls has no meaning(mayb)
             boxes.data, result.boxes_all, src_seq, tgt_seq, gt_obj_comb[:,:3], norm_boxes,
-            vr if (self.use_union_boxes or self.use_extra_pos )else None, u_rois if self.use_union_boxes else None)
+            vr if (self.use_union_boxes or self.use_extra_pos )else None, u_rois if self.use_union_boxes else None, result.od_attrs, result.od_attr_dist)
 
         if self.filenames is not None and self.save_attn:
             filenames = self.filenames[self.counter * self.batch_size:self.counter * self.batch_size + self.batch_size]
@@ -591,11 +596,12 @@ class TransformerModel(nn.Module):
         if self.focal_loss:
             result.rel_dists = F.softmax(result.rel_dists, dim=1)
 
-        if self.training:
+        if self.training and not self.inference:
             return result
 
 
-
+        if self.use_attr:
+            result.attr_dist = torch.cat((gt_attr_index,result.attr_dist),1)
         result.obj_scores =  F.softmax(result.rm_obj_dists, dim=1).max(1)[0]  # removed 1: index
         # Bbox regression
         if self.mode == 'sgdet':
@@ -605,16 +611,19 @@ class TransformerModel(nn.Module):
         else:
             # Boxes will get fixed by filter_dets function.
             bboxes = result.rm_box_priors
-        if self.focal_loss:  #todo change properly into nice one
+        if self.focal_loss:
             rel_rep = result.rel_dists #F.softmax(result.rel_dists, dim=1)
         else:
             rel_rep = F.softmax(result.rel_dists, dim=1)
 
-        return filter_dets(self.batch_size, bboxes, result.obj_scores, result.obj_preds, result.all_rels,
-                           rel_rep, result.pred_obj_rel_mat, result.gt_obj_rel_mat, result.rm_obj_dists, result.edge_dist, result.edge_gt_lbl)
+        return filter_dets(self.batch_size, bboxes, result.obj_scores, result.obj_preds, result.all_rels, rel_rep, result.pred_obj_rel_mat,
+                            result.gt_obj_rel_mat, result.rm_obj_dists, result.edge_dist, result.edge_gt_lbl, result.attr_dist, inference=self.inference)
 
-    def __getitem__(self, batch):
+    def __getitem__(self, batch, eval_train=False):
         """ Hack to do multi-GPU training"""
+        if self.inference:  # to get the exact trainign data
+            self.training = batch[1]
+            batch = batch[0]
         batch.scatter()
         if self.num_gpus == 1:
             return self(*batch[0])

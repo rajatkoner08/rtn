@@ -352,7 +352,7 @@ def enumerate_by_image(im_inds):
 #     return fwd_rels, inv_rels
 
 
-def get_obj_comb_by_batch(obj_comb, im_inds, fwd_rels, inv_rels):
+def get_obj_comb_by_batch(obj_comb, im_inds, fwd_rels, inv_rels, attributes):
 
     fwd_rel_return = []
     inv_rels_return = []
@@ -371,6 +371,9 @@ def get_obj_comb_by_batch(obj_comb, im_inds, fwd_rels, inv_rels):
     else:
         inv_rels_np = inv_rels.cpu().numpy()
 
+    if not attributes is None:
+        attributes_np = attributes.cpu().numpy()
+
     im_offset = {}
     for i, s, e in enumerate_by_image(im_inds):  # increment image number
         im_offset[i] = s
@@ -379,6 +382,13 @@ def get_obj_comb_by_batch(obj_comb, im_inds, fwd_rels, inv_rels):
     for i, s, e in enumerate_by_image(obj_comb[:, 0]):     #increment edge number
         pred_offset[i] = s
         obj_comb[s:e, 1:3] += im_offset[i]                   #incriment object number as per batch
+
+    if not attributes is None:
+        for i, attr in enumerate(attributes_np):            #increment image number 4 attributes
+            attributes_np[i,1] += im_offset[attributes_np[i,0]]
+        attributes_return = torch.from_numpy(attributes_np).cuda()
+    else:
+        attributes_return = None
 
     if fwd_rel_return  is not None:
         for i, pred in enumerate(fwd_rels_np):
@@ -392,7 +402,7 @@ def get_obj_comb_by_batch(obj_comb, im_inds, fwd_rels, inv_rels):
             inv_rels_np[i][2:4] += im_offset[pred[0]]       #increment image number
         inv_rels_return = torch.from_numpy(inv_rels_np).cuda()
 
-    return obj_comb, fwd_rel_return, inv_rels_return
+    return obj_comb, fwd_rel_return, inv_rels_return, attributes_return
 
 
 def diagonal_inds(tensor):
@@ -623,10 +633,10 @@ def get_normalized_rois(rois_normalized, data_height, data_width, spatial_scale)
 
     return rois_normalized
 
-def get_combined_feats(visual_feats, obj_word_emb, bboxes, compress_feats, normalized_pos=False, pos_embed=None, obj_dist =None, obj_comb = None, edge=False, union=False, use_spatial = False,gap=None):
+def get_combined_feats(visual_feats, obj_word_emb, bboxes, compress_feats, normalized_pos=False, pos_embed=None, obj_dist =None, obj_comb = None, edge=False, union=False, spatial_box = False,gap=None):
     #combine vis_feats+obj_class+position for both node and predicate
-    if not use_spatial:
-        pos_feats = torch.Tensor().cuda()
+    if spatial_box:
+        pos_feats = torch.zeros((0,0)).cuda()
     elif normalized_pos:
             pos_feats = bboxes  #get_normalized_rois(bboxes, data_height, data_width, spatial_scale=1)
     else:
@@ -642,7 +652,7 @@ def get_combined_feats(visual_feats, obj_word_emb, bboxes, compress_feats, norma
     else:
         feats_pre_rep = torch.cat((visual_feats, word_emb_master, pos_feats, obj_dist), 1)
 
-    if gap is not None:
+    if gap is not None and not edge:
         feats_pre_rep = torch.cat((feats_pre_rep, gap), 1)
 
     # now apply linear projection layer
@@ -665,11 +675,11 @@ def get_combined_feats(visual_feats, obj_word_emb, bboxes, compress_feats, norma
     # return compress_feats(feats_pre_rep)
 
 
-def get_feats_size(pooling_dim, use_word_emb, use_normalized_roi, use_union, use_spatial, spatial_box = False, word_dim = 200, num_classes = 151, use_relative_box= None, use_gap=False):
+def get_feats_size(pooling_dim, use_word_emb, use_normalized_roi, use_union, spatial_box = False, word_dim = 200, num_classes = 151, use_gap=False, gap_dim=512):
 
     node_dim = 0
     edge_dim = 0
-    if spatial_box or not use_spatial:
+    if spatial_box:
         pos_dim = 0
     elif use_normalized_roi:
         pos_dim = 5
@@ -686,11 +696,12 @@ def get_feats_size(pooling_dim, use_word_emb, use_normalized_roi, use_union, use
         node_dim = pooling_dim + word_dim + pos_dim
     else:
             node_dim = pooling_dim+num_classes+pos_dim
-    if use_gap:
-        node_dim+=512
 
     if edge_dim==0:
         edge_dim = node_dim
+
+    if use_gap:
+        node_dim+=gap_dim
 
     return node_dim, edge_dim
 
@@ -706,3 +717,6 @@ def get_index_pos(seq):
     for i, s, e in enumerate_by_image(torch.nonzero(seq)[:, 0]):
         obj_index[i, :e - s] = torch.arange(1, ((e - s) + 1))
     return obj_index
+
+
+

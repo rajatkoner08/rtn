@@ -8,7 +8,7 @@ from enum import Enum
 import numpy as np
 
 ROOT_PATH = "/nfs/data3/koner"
-DATA_PATH = 'data'#os.path.join(ROOT_PATH, 'data')
+DATA_PATH = os.path.join(ROOT_PATH, 'data')
 VRD_DATA_DIR = os.path.join(DATA_PATH,'vidVRD')
 VIDEO_DICT_PATH = os.path.join(VRD_DATA_DIR,'vidVRD-dataset')
 FRAME_PATH = os.path.join(VRD_DATA_DIR,'vidVRD-frames')
@@ -47,7 +47,7 @@ MODES = ('sgdet', 'sgcls', 'predcls')
 POS_ENCODING_TYPE = ('unnormalized', 'no_enc', 'normalized')
 
 BOX_SCALE = 1024  # Scale at which we have the boxes
-IM_SCALE = 592      # Our images will be resized to this res without padding
+IM_SCALE = 1024       # Our images will be resized to this res without padding
 
 TEST = 25/200 #test/validation splits
 
@@ -65,6 +65,7 @@ RPN_NEGATIVE_OVERLAP = 0.3
 #proposed relation threshold
 Rel_Threshold = 0.5
 EDGE_THRESHOLD = 0.4
+NumAttr = 618
 
 # Max number of foreground examples
 RPN_FG_FRACTION = 0.5
@@ -74,8 +75,8 @@ RPN_BATCHSIZE = 256
 ROIS_PER_IMG = 256
 REL_FG_FRACTION = 0.25
 RELS_PER_IMG = 256
-BG_EDGE_PER_IMG = 75
-FG_EDGE_PER_IMG = 25
+BG_EDGE_PER_IMG = 150
+FG_EDGE_PER_IMG = 50
 BG_EDGE = 2
 
 RELS_PER_IMG_REFINE = 64
@@ -112,16 +113,18 @@ class ModelConfig(object):
         self.test = False
         self.optimizer = None
         self.multi_pred=False
+        self.refine_obj = False
         self.cache = None
         self.model = None
         self.use_proposals=False
         self.use_resnet=False
+        self.use_mmdet=False
         self.use_tanh=False
         self.pad_batch=None
         self.use_bias = False
+        self.use_attr = False
         self.num_epochs=None
         self.spo=None
-        self.use_warmup=None
         self.use_bg=None
         self.det_ckpt=None
         self.nl_edge=None
@@ -144,7 +147,7 @@ class ModelConfig(object):
         self.obj_index_enc = True
         self.use_bg_rels = True
         self.normalized_roi = True
-        self.num_run = None
+        self.run_desc = None
         self.g1 = None
         self.g2 = None
         self.g3 = None
@@ -154,7 +157,7 @@ class ModelConfig(object):
         self.use_word_emb = True
         self.use_FL = True
         self.vg_mini = False
-        self.seperate_edge =False
+        self.eval_method =False
         self.use_extra_pos = False
         self.use_nm_baseline = False
         self.train_obj_roi = False
@@ -183,22 +186,22 @@ class ModelConfig(object):
 
         self.__dict__.update(self.args)
 
-        # if len(self.ckpt) != 0:
-        #     self.ckpt = os.path.join(ROOT_PATH, self.ckpt)
-        # else:
-        #     self.ckpt = None
+        if len(self.ckpt) != 0:
+            self.ckpt = os.path.join(ROOT_PATH, self.ckpt)
+        else:
+            self.ckpt = None
 
-        # if len(self.cache) != 0:
-        #     self.cache = os.path.join(ROOT_PATH, self.cache)
-        # else:
-        #     self.cache = None
+        if len(self.cache) != 0:
+            self.cache = os.path.join(ROOT_PATH, self.cache)
+        else:
+            self.cache = None
 
-        # if len(self.save_dir) == 0:
-        #     self.save_dir = None
-        # else:
-        #     self.save_dir = os.path.join(ROOT_PATH, self.save_dir)
-        if not os.path.exists(self.save_dir):
-            os.mkdir(self.save_dir)
+        if len(self.save_dir) == 0:
+            self.save_dir = None
+        else:
+            self.save_dir = os.path.join(ROOT_PATH, self.save_dir)
+            if not os.path.exists(self.save_dir):
+                os.mkdir(self.save_dir)
 
         assert self.val_size >= 0
 
@@ -229,7 +232,7 @@ class ModelConfig(object):
         parser.add_argument('-save_dir', dest='save_dir',
                             help='Directory to save things to, such as checkpoints/save', default='', type=str)
 
-        parser.add_argument('-ngpu', dest='num_gpus', help='cuantos GPUs tienes', type=int, default=3)
+        parser.add_argument('-ngpu', dest='num_gpus', help='cuantos GPUs tienes', type=int, default=1)
         parser.add_argument('-nwork', dest='num_workers', help='num processes to use as workers', type=int, default=0)
 
         parser.add_argument('-lr', dest='lr', help='learning rate', type=float, default=1e-3)
@@ -245,7 +248,7 @@ class ModelConfig(object):
         parser.add_argument('-m', dest='mode', help='mode \in {sgdet, sgcls, predcls}', type=str, default='sgdet')
         parser.add_argument('-model', dest='model', help='which model to use? (motifnet, stanford). If you want to use the baseline (NoContext) model, then pass in motifnet here, and nl_obj, nl_edge=0', type=str,
                             default='motifnet')
-        parser.add_argument('-spo', dest='spo', help='in final features concat all s,p,o/s,o,p',  type=str, default='')
+        parser.add_argument('-spo', dest='spo', help='in final features concat all s,p,o/s,o,p',  type=str, default='spo')
         parser.add_argument('-use_bg', dest='use_bg', help='Use full image as background feature in transformer', action='store_true')
         parser.add_argument('-cache', dest='cache', help='where should we cache predictions', type=str,
                             default='')
@@ -255,6 +258,7 @@ class ModelConfig(object):
         parser.add_argument('-multipred', dest='multi_pred', help='Allow multiple predicates per pair of box0, box1.', action='store_true')
         parser.add_argument('-nepoch', dest='num_epochs', help='Number of epochs to train the model for',type=int, default=25)
         parser.add_argument('-resnet', dest='use_resnet', help='use resnet instead of VGG', action='store_true')
+        parser.add_argument('-mmdet', dest='use_mmdet', help='use resnet instead of VGG', action='store_true')
         parser.add_argument('-proposals', dest='use_proposals', help='Use Xu et als proposals', action='store_true')
         parser.add_argument('-nl_obj', dest='nl_obj', help='Num object layers', type=int, default=2)
         parser.add_argument('-nl_edge', dest='nl_edge', help='Num edge layers', type=int, default=2)
@@ -263,30 +267,31 @@ class ModelConfig(object):
         parser.add_argument('-attn_dim', dest='attn_dim', help='self attention dim', type=int, default=512)
         parser.add_argument('-bert_embd_dim', dest='bert_embd_dim', help='bert word vec embedding dim', type=int, default=200)#todo temp for matching attn dim == word_vec
         parser.add_argument('-n_head', dest='n_head', help='num of attention head', type=int, default=8)
-        parser.add_argument('-max_object', dest='max_token_seq_len', help='num of max object processed for positional encoding', type=int, default=64)
+        parser.add_argument('-max_object', dest='max_token_seq_len', help='num of max object processed for positional encoding', type=int, default=200)
         parser.add_argument('-pooling_dim', dest='pooling_dim', help='Dimension of pooling', type=int, default=4096)
         parser.add_argument('-spatial_box', dest='spatial_box', action='store_true',default=False)
         parser.add_argument('-pass_obj_feats_to_classifier', dest='pass_obj_feats_to_classifier', action='store_true')
         parser.add_argument('-dropout', dest='dropout', help='transformer dropout to add', type=float, default=0.1)
         parser.add_argument('-use_bias', dest='use_bias',  action='store_true')
+        parser.add_argument('-use_attr', dest='use_attr', action='store_true')
         parser.add_argument('-use_union_boxes', dest='union_boxes', action='store_true')
         parser.add_argument('-require_overlap', dest='require_overlap_det', action='store_true')
         parser.add_argument('-normalized_roi', dest='normalized_roi', action='store_true')
-        parser.add_argument('-highlight_sub_obj', dest='highlight_sub_obj', action='store_true', default=True)
+        parser.add_argument('-highlight_sub_obj', dest='highlight_sub_obj', action='store_true',default=True)
         parser.add_argument('-obj_index_enc', dest='obj_index_enc', action='store_true', default=True)
-        parser.add_argument('-seperate_edge', dest='seperate_edge', action='store_false')
+        parser.add_argument('-eval_method', dest='eval_method', help='evaluation methods gt/overlap/increase_overlap', type=str, default='gt')
         parser.add_argument('-embs_share_weight', dest='embs_share_weight', action='store_false')
         parser.add_argument('-use_tanh', dest='use_tanh',  action='store_true')
         parser.add_argument('-use_bg_rels', dest='use_bg_rels', action='store_true')
         parser.add_argument('-use_word_emb', dest='use_word_emb', action='store_true')
         parser.add_argument('-use_FL', dest='use_FL', action='store_true')
-        parser.add_argument('-use_warmup', dest='use_warmup', action='store_true')
-        parser.add_argument('-train_obj_roi', dest='train_obj_roi', action='store_true')
+        parser.add_argument('-train_obj_roi', dest='train_obj_roi', action='store_true', default=True)
         parser.add_argument('-train_detector', dest='train_detector', action='store_true')
         parser.add_argument('-reduce_lr_obj_enc', dest='reduce_lr_obj_enc', action='store_true')
         parser.add_argument('-reduce_bg_loss', dest='reduce_bg_loss', action='store_true')
-        parser.add_argument('-reduce_lr', dest='reduce_lr',help='reduces the le of od and classifier', action='store_true')
+        parser.add_argument('-reduce_lr', dest='reduce_lr',help='reduces the le of od and classifier', action='store_true', default=False)
         parser.add_argument('-freeze_obj_enc', dest='freeze_obj_enc', action='store_true')
+        parser.add_argument('-use_obj_refinement', dest='refine_obj', action='store_true')
         parser.add_argument('-use_nm_baseline', dest='use_nm_baseline', action='store_true', default=False)  #todo change dedfault here
         parser.add_argument('-use_edge2edge', dest='edge2edge_attn', action='store_true',  default=False)  # todo change dedfault here
         parser.add_argument('-g1', dest='g1', help='gama value of class loss', type=float, default=1.0)
@@ -303,6 +308,9 @@ class ModelConfig(object):
         parser.add_argument('-use_valid_edges', dest='use_valid_edges', help='use relation based on valied edges',
                             action='store_true', default=False)
         parser.add_argument('-original_valid', dest='o_valid', help='use original training and validation splits',
-                            action='store_true', default=True)
+                            action='store_true', default=False)
         parser.add_argument('-dataset', dest='dataset', help='dataset \in {vg, vrd}', type=str, default='vg')
+        parser.add_argument('-mmdet_config', help='config file for the mmdetection model', type=str,
+                            default='mmdetection/work_dirs/detectors_cascade_rcnn_r50_1x_gqa/detectors_cascade_rcnn_r50_1x_gqa.py')
+
         return parser

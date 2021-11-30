@@ -16,6 +16,7 @@ class BasicSceneGraphEvaluator:
         self.result_dict = {}
         self.mode = mode
         self.result_dict[self.mode + '_recall'] = {20: [], 50: [], 100: [], 'class_accuracy': []}
+        self.attr_acc=[]
         self.rel_pred_acc = []
         self.edge_pred_acc = []
         self.edge_recall = []
@@ -35,7 +36,7 @@ class BasicSceneGraphEvaluator:
 
     def evaluate_scene_graph_entry(self, gt_entry, pred_scores, viz_dict=None, iou_thresh=0.5):
         res = evaluate_from_dict(gt_entry, pred_scores, self.mode, self.result_dict, self.rel_pred_acc,
-                                 self.edge_pred_acc, self.edge_recall, self.rel_recall, topfive=self.topfive_pred, iou_thresh=iou_thresh, multiple_preds=self.multiple_preds)
+                                 self.edge_pred_acc, self.edge_recall, self.rel_recall, self.attr_acc, topfive=self.topfive_pred, iou_thresh=iou_thresh, multiple_preds=self.multiple_preds)
         return res
 
     def save(self, fn):
@@ -73,9 +74,14 @@ class BasicSceneGraphEvaluator:
             if writer is not None:
                 writer.add_scalar('edge_pred_acc', np.mean(self.edge_pred_acc), epoch_num)
                 #writer.add_scalar('pred_vs_actual_edge', np.mean(self.edge_recall), epoch_num)
+        #now write the attribute prediction accuracy
+        if len(self.attr_acc) >0 :
+            print('Attribute accuracy : ',np.mean(self.attr_acc))
+            if writer is not None:
+                writer.add_scalar('attr_pred_acc', np.mean(self.attr_acc), epoch_num)
 
 def evaluate_from_dict(gt_entry, pred_entry, mode, result_dict, rel_pred_acc, edge_pred_acc,
-                       edge_recall, rel_recall, multiple_preds=False, topfive=None, **kwargs):
+                       edge_recall, rel_recall, attr_acc, multiple_preds=False, topfive=None, **kwargs):
     """
     Shortcut to doing evaluate_recall from dict
     :param gt_entry: Dictionary containing gt_relations, gt_boxes, gt_classes
@@ -89,9 +95,12 @@ def evaluate_from_dict(gt_entry, pred_entry, mode, result_dict, rel_pred_acc, ed
     gt_rels = gt_entry['gt_relations']
     gt_boxes = gt_entry['gt_boxes'].astype(float)
     gt_classes = gt_entry['gt_classes']
+    gt_attrs = gt_entry['gt_attrs']
+
 
     pred_rel_inds = pred_entry['pred_rel_inds']
     rel_scores = pred_entry['rel_scores']
+    pred_attrs = pred_entry['pred_attrs']
 
     pred_classes_temp =  pred_entry['obj_preds'] #to avoid class_accu =1 for predcls
     #now  how accurate the relation proposal network is
@@ -170,6 +179,12 @@ def evaluate_from_dict(gt_entry, pred_entry, mode, result_dict, rel_pred_acc, ed
         if pred_entry['pred_edge'] is not None:
             edge_pred_acc.append((pred_edge==true_edge).sum()/true_edge.sum())
             edge_recall.append(np.count_nonzero(pred_edge==1)  / true_edge.sum())
+        if pred_attrs is not None:
+            ## for threshold of 0.5 accuracy should be 100% while from accepted answer you will get 66.67% so
+            pred_attrs[pred_attrs >= 0.5] = 1
+            pred_attrs[pred_attrs < 0.5] = 0  ## assign 0 label to those with less than 0.5
+            if len(gt_attrs)>0:
+                attr_acc.append(len(np.argwhere((gt_attrs !=0) & (pred_attrs !=0))) / len(gt_attrs))
 
     for k in result_dict[mode + '_recall']:
         if k == 'class_accuracy':

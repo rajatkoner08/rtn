@@ -65,7 +65,7 @@ cdef np.ndarray[DTYPE_t, ndim=4] draw_union_boxes_c(
                 y1_box = (box_pairs[n, 1+4*i] - y1_union)*pooling_size / h
                 x2_box = (box_pairs[n, 2+4*i] - x1_union)*pooling_size / w
                 y2_box = (box_pairs[n, 3+4*i] - y1_union)*pooling_size / h
-                #print("{:.3f}, {:.3f}, {:.3f}, {:.3f}".format(x1_box, y1_box, x2_box, y2_box))
+                # print("{:.3f}, {:.3f}, {:.3f}, {:.3f}".format(x1_box, y1_box, x2_box, y2_box))
                 for j in range(pooling_size):
                     y_contrib = minmax(j+1-y1_box)*minmax(y2_box-j)
                     # if i == 0:
@@ -79,4 +79,5 @@ cdef np.ndarray[DTYPE_t, ndim=4] draw_union_boxes_c(
 
                         # print("j {} yc {} k {} xc {}".format(j, y_contrib, k, x_contrib))
                         uboxes[n,i,j,k] = x_contrib*y_contrib
+        #print(" shape of uboxes array : ", uboxes.size)
     return uboxes

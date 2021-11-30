@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 from torchvision.transforms import Resize, Compose, ToTensor, Normalize
 from dataloaders.blob import Blob
 from lib.fpn.box_utils import bbox_overlaps
-from config import VG_IMAGES, IM_DATA_FN, VG_SGG_FN, LABEL_DATA_DIR, BOX_SCALE, IM_SCALE, PROPOSAL_FN,BG_EDGE_PER_IMG, FG_EDGE_PER_IMG,PROJECT_PATH
+from config import VG_IMAGES, IM_DATA_FN, VG_SGG_FN, LABEL_DATA_DIR, BOX_SCALE, IM_SCALE, PROPOSAL_FN,BG_EDGE_PER_IMG, FG_EDGE_PER_IMG,PROJECT_PATH, NumAttr
 DATA_DIR = os.path.join(PROJECT_PATH,'data','gqa')
 
 from dataloaders.image_transforms import SquarePad, Grayscale, Brightness, Sharpness, Contrast, \
@@ -24,11 +24,12 @@ from lib.CustomSampler import CustomSampler
 from lib.helper import get_fwd_inv_rels
 
 
+
 class VG(Dataset):
     def __init__(self, mode, roidb_file=VG_SGG_FN, dict_file=LABEL_DATA_DIR,
                  image_file=IM_DATA_FN, filter_empty_rels=True, num_im=-1, num_val_im=5000,
                  filter_duplicate_rels=True, filter_non_overlap=True, require_overlap = False,o_valid =False,
-                 use_proposals=False,use_bg_rels =True, use_bg =True):
+                 use_proposals=False,use_bg_rels =True, use_bg =True, all_cls_attr=False):
         """
         Torch dataset for VisualGenome
         :param mode: Must be train, test, or val
@@ -44,7 +45,7 @@ class VG(Dataset):
         :param proposal_file: If None, we don't provide proposals. Otherwise file for where we get RPN
             proposals
         """
-        with open(os.path.join(DATA_DIR,mode+'_sceneGraphs.pkl'), 'rb') as pickle_file:
+        with open(os.path.join(DATA_DIR,mode+'_sceneGraphs_full.pkl'), 'rb') as pickle_file: # full or just graph
             content = pickle.load(pickle_file)
         if mode not in ('test', 'train', 'val'):
             raise ValueError("Mode must be in test, train, or val. Supplied {}".format(mode))
@@ -62,20 +63,35 @@ class VG(Dataset):
         self.gt_classes=[]
         self.gt_boxes=[]
         self.relationships=[]
-        self.attributes = []
+        self.gt_attr = []
 
         self.filenames = list(content.keys())
         # get all info from file
         for item in np.asarray(list(content.items()))[:, 1]:
-            self.gt_classes.append(np.asarray(item['classes'])[:,1])
+            classes = np.asarray(item['classes'])[:,1]
+            self.gt_classes.append(classes)
             self.gt_boxes.append(np.asarray(item['boxes']))
             self.relationships.append(np.asarray(item['rels']))
-            self.attributes.append(np.asarray(item['attributes']))
+            gt_attr = item['attributes']
+            if all_cls_attr: # take all classes for all the attribute
+                gt_attr_dist = np.zeros((len(classes), NumAttr + 1), dtype=np.int64)
+                for i in range(len(classes)):
+                    gt_attr_dist[i, 0] = i
+                    if i in gt_attr.keys():
+                        gt_attr_dist[i, :][np.asarray(gt_attr[i]) + 1] = 1
+            else: # take classes only with attributes
+                gt_attr_dist = np.zeros((len(gt_attr), NumAttr + 1), dtype=np.int64)
+                for i, (cls, attrs) in enumerate(gt_attr.items()):
+                    gt_attr_dist[i, 0] = cls
+                    gt_attr_dist[i, :][np.asarray(attrs) + 1] = 1
+            self.gt_attr.append(gt_attr_dist)
 
-        with open(os.path.join(DATA_DIR,'ind_to_class .pkl'), 'rb') as pickle_file:
+        with open(os.path.join(DATA_DIR,'ind_to_class_full.pkl'), 'rb') as pickle_file:
             self.ind_to_classes = pickle.load(pickle_file)
-        with open(os.path.join(DATA_DIR,'ind_to_rels.pkl'), 'rb') as pickle_file:
+        with open(os.path.join(DATA_DIR,'ind_to_rels_full.pkl'), 'rb') as pickle_file:
             self.ind_to_predicates = pickle.load(pickle_file)
+        with open(os.path.join(DATA_DIR, 'ind_to_attr_full.pkl'), 'rb') as pickle_file:
+            self.ind_to_attr = pickle.load(pickle_file)
 
 
         if use_proposals:
@@ -162,6 +178,13 @@ class VG(Dataset):
         flipped = False
         gt_boxes = self.gt_boxes[index].copy()
 
+        # #format attributes data for multiclass prediction
+        # gt_attr = self.gt_attr[index].copy()
+        # gt_attr_dist = np.zeros((len(gt_attr), NumAttr+1),dtype=np.int64)
+        # for i, (cls, attrs) in enumerate(gt_attr.items()):
+        #     gt_attr_dist[i,0] = cls
+        #     gt_attr_dist[i,:][np.asarray(attrs)+1]= 1
+
         w, h = image_unpadded.size
         box_scale_factor = BOX_SCALE / max(w, h)
         gt_boxes = gt_boxes * box_scale_factor  # multiply bbox by this number to make them BOX_SCALE
@@ -176,8 +199,6 @@ class VG(Dataset):
 
             # # crop the image for data augmentation
             # image_unpadded, gt_boxes = random_crop(image_unpadded, gt_boxes, BOX_SCALE, round_boxes=True)
-
-
 
         img_scale_factor = IM_SCALE / max(w, h)
         if h > w:
@@ -206,6 +227,7 @@ class VG(Dataset):
             'img_size': im_size,
             'gt_boxes': gt_boxes,
             'gt_classes': self.gt_classes[index].copy(),
+            'gt_attr': self.gt_attr[index].copy(),
             'gt_relations': gt_rels,
             'fwd_relations': fwd_rels,
             'inv_relations': inv_rels,
@@ -389,110 +411,6 @@ def load_image_filenames(image_file, image_dir=VG_IMAGES):
     return fns
 
 
-def load_graphs(graphs_file, mode='train', num_im=-1, num_val_im=0, filter_empty_rels=True,
-                filter_non_overlap=False, orig_split=False):
-    """
-    Load the file containing the GT boxes and relations, as well as the dataset split
-    :param graphs_file: HDF5
-    :param mode: (train, val, or test)
-    :param num_im: Number of images we want
-    :param num_val_im: Number of validation images
-    :param filter_empty_rels: (will be filtered otherwise.)
-    :param filter_non_overlap: If training, filter images that dont overlap.
-    :return: image_index: numpy array corresponding to the index of images we're using
-             boxes: List where each element is a [num_gt, 4] array of ground
-                    truth boxes (x1, y1, x2, y2)
-             gt_classes: List where each element is a [num_gt] array of classes
-             relationships: List where each element is a [num_r, 3] array of
-                    (box_ind_1, box_ind_2, predicate) relationships
-    """
-    if mode not in ('train', 'val', 'test'):
-        raise ValueError('{} invalid'.format(mode))
-
-    roi_h5 = h5py.File(graphs_file, 'r')
-    data_split = roi_h5['split'][:]
-    if orig_split:
-        split = 2 if mode == 'test' else 0
-    else:
-        split = 2 if mode in ['test', 'val'] else 0
-    #split = 2 if mode in ['test', 'val'] else 0  #only when u gonna use validation from test
-    split_mask = data_split == split
-
-    # Filter out images without bounding boxes
-    split_mask &= roi_h5['img_to_first_box'][:] >= 0
-    if filter_empty_rels:
-        split_mask &= roi_h5['img_to_first_rel'][:] >= 0
-
-    image_index = np.where(split_mask)[0]
-    if num_im > -1:
-        image_index = image_index[num_val_im:]
-    if num_val_im > 0:
-        if mode == 'val':           #take few samples from test as val
-            image_index = image_index[:num_val_im]
-        elif mode == 'train' and orig_split:                       #todo use this flag to switch between original and modified val set
-            image_index = image_index[num_val_im:]
-
-    split_mask = np.zeros_like(data_split).astype(bool)
-    split_mask[image_index] = True
-
-    # Get box information
-    all_labels = roi_h5['labels'][:, 0]
-    all_boxes = roi_h5['boxes_{}'.format(BOX_SCALE)][:]  # will index later
-    assert np.all(all_boxes[:, :2] >= 0)  # sanity check
-    assert np.all(all_boxes[:, 2:] > 0)  # no empty box
-
-    # convert from xc, yc, w, h to x1, y1, x2, y2
-    all_boxes[:, :2] = all_boxes[:, :2] - all_boxes[:, 2:] / 2
-    all_boxes[:, 2:] = all_boxes[:, :2] + all_boxes[:, 2:]
-
-    im_to_first_box = roi_h5['img_to_first_box'][split_mask]
-    im_to_last_box = roi_h5['img_to_last_box'][split_mask]
-    im_to_first_rel = roi_h5['img_to_first_rel'][split_mask]
-    im_to_last_rel = roi_h5['img_to_last_rel'][split_mask]
-
-    # load relation labels
-    _relations = roi_h5['relationships'][:]
-    _relation_predicates = roi_h5['predicates'][:, 0]
-    assert (im_to_first_rel.shape[0] == im_to_last_rel.shape[0])
-    assert (_relations.shape[0] == _relation_predicates.shape[0])  # sanity check
-
-    # Get everything by image.
-    boxes = []
-    gt_classes = []
-    relationships = []
-    for i in range(len(image_index)):
-        boxes_i = all_boxes[im_to_first_box[i]:im_to_last_box[i] + 1, :]
-        gt_classes_i = all_labels[im_to_first_box[i]:im_to_last_box[i] + 1]
-
-        if im_to_first_rel[i] >= 0:
-            predicates = _relation_predicates[im_to_first_rel[i]:im_to_last_rel[i] + 1]
-            obj_idx = _relations[im_to_first_rel[i]:im_to_last_rel[i] + 1] - im_to_first_box[i]
-            assert np.all(obj_idx >= 0)
-            assert np.all(obj_idx < boxes_i.shape[0])
-            rels = np.column_stack((obj_idx, predicates))
-        else:
-            assert not filter_empty_rels
-            rels = np.zeros((0, 3), dtype=np.int32)
-
-        if filter_non_overlap:
-            assert mode == 'train'
-            inters = bbox_overlaps(boxes_i, boxes_i)
-            rel_overs = inters[rels[:, 0], rels[:, 1]]
-            inc = np.where(rel_overs > 0.0)[0]
-
-            if inc.size > 0:
-                rels = rels[inc]
-            else:
-                split_mask[image_index[i]] = 0
-                continue
-
-        boxes.append(boxes_i)
-        gt_classes.append(gt_classes_i)
-        relationships.append(rels)
-
-    return split_mask, boxes, gt_classes, relationships
-
-
 def load_info(info_file):
     """
     Loads the file containing the visual genome label meanings
@@ -515,7 +433,7 @@ def load_info(info_file):
 def vg_collate(data, num_gpus=3, is_train=False, mode='det'):
     assert mode in ('det', 'rel')
     blob = Blob(mode=mode, is_train=is_train, num_gpus=num_gpus,
-                batch_size_per_gpu=len(data) // num_gpus)
+                batch_size_per_gpu=len(data) // num_gpus, dataset='gqa')
 
     #add padding in batches
     maxNumOfObjInBatch = max(len(frame['gt_boxes']) for frame in data)
@@ -549,18 +467,18 @@ class VGDataLoader(torch.utils.data.DataLoader):
     """
 
     @classmethod
-    def splits(cls, train_data, val_data, batch_size=3, num_workers=0, num_gpus=3, mode='det', vg_mini = False, o_val=False,
+    def splits(cls, train_data, val_data, batch_size=3, num_workers=0, num_gpus=3, mode='det', vg_mini = False, o_val=False,shuffle=True,
                **kwargs):
         assert mode in ('det', 'rel')
-        sampler = CustomSampler(train_data, vg_mini, o_val)
+        #sampler = CustomSampler(train_data, vg_mini, o_val)
         train_load = cls(
             dataset=train_data,
             batch_size=batch_size * num_gpus,
-            shuffle=False,
+            shuffle=shuffle,
             num_workers=num_workers,
             collate_fn=lambda x: vg_collate(x, mode=mode, num_gpus=num_gpus, is_train=True),
             drop_last=True,
-            sampler = sampler,
+            #sampler = sampler,
             #worker_init_fn = torch.set_rng_state(torch.initial_seed()),
             # pin_memory=True,
             **kwargs,

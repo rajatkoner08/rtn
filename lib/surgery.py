@@ -18,7 +18,8 @@ from lib.fpn.box_utils import bbox_overlaps
 # from ad3 import factor_graph as fg
 from time import time
 
-def filter_dets(batch_size, boxes, obj_max_scores, obj_classes, rel_inds, pred_scores, pred_obj_rel_mat, gt_obj_rel_mat, obj_dist, edge_dist, gt_edge):
+def filter_dets(batch_size, boxes, obj_max_scores, obj_classes, rel_inds, pred_scores, pred_obj_rel_mat,
+                gt_obj_rel_mat, obj_dist, edge_dist, gt_edge, attr_dist=None, inference=False):
     """
     Filters detections....
     :param boxes: [num_box, topk, 4] if bbox regression else [num_box, 4]
@@ -47,13 +48,17 @@ def filter_dets(batch_size, boxes, obj_max_scores, obj_classes, rel_inds, pred_s
         pred_obj_rel_mat_np = pred_obj_rel_mat.data.cpu().numpy()
         gt_obj_rel_mat_np = gt_obj_rel_mat.data.cpu().numpy()
 
+    if attr_dist is not None:
+        attr_dist_np = attr_dist.data.cpu().numpy()
+
     if edge_dist is not None:
         pred_edge = edge_dist.view(batch_size, edge_dist.shape[0] // batch_size).data.cpu().numpy()
         true_edge = gt_edge.view(batch_size, gt_edge.shape[0] // batch_size).data.cpu().numpy()
 
     obj_preds = obj_preds.reshape(batch_size, obj_classes.shape[0] // batch_size)
     objs_np = objs_np.reshape(batch_size, obj_classes.shape[0] // batch_size)
-    obj_scores_np = obj_scores_all_np.reshape(batch_size, obj_max_scores.shape[0] // batch_size)
+    max_obj_scores_np = obj_scores_all_np.reshape(batch_size, obj_max_scores.shape[0] // batch_size)
+    obj_dist_np = obj_dist.data.cpu().numpy().reshape(batch_size, obj_max_scores.shape[0] // batch_size, -1)
     boxes_np = boxes_np.reshape(batch_size, boxes.shape[0] // batch_size, 4)
 
     image_ofset = objs_np.shape[1]
@@ -62,7 +67,7 @@ def filter_dets(batch_size, boxes, obj_max_scores, obj_classes, rel_inds, pred_s
     g_o_r_m = None
     pred_edge_batch = None
     gt_edge_batch = None
-    for i, (batch_box, batch_obj_scores, batch_obj_cls, batch_obj_preds) in enumerate(zip(boxes_np, obj_scores_np, objs_np, obj_preds)):
+    for i, (batch_box, max_batch_obj_scores, batch_obj_dist, batch_obj_cls, batch_obj_preds) in enumerate(zip(boxes_np, max_obj_scores_np, obj_dist_np, objs_np, obj_preds)):
 
         batch_rels_ind = np.where(rel_inds_np[:,0]==i)[0]
         rels_ind = rel_inds_np[batch_rels_ind][:,2:]
@@ -78,10 +83,15 @@ def filter_dets(batch_size, boxes, obj_max_scores, obj_classes, rel_inds, pred_s
             pred_edge_batch = pred_edge[i,:]
             gt_edge_batch = true_edge[i,:]
 
-        num_box = batch_box.shape[0]
-        assert batch_obj_scores.shape[0] == num_box
+        if attr_dist is not None:
+            batch_attr_dist = attr_dist_np[np.where(attr_dist_np[:,0]==i)[0],1:]
+        else:
+            batch_attr_dist = None
 
-        assert  len(batch_obj_cls) == len(batch_obj_scores) == len(batch_obj_preds)
+        num_box = batch_box.shape[0]
+        assert max_batch_obj_scores.shape[0] == num_box
+
+        assert  len(batch_obj_cls) == len(max_batch_obj_scores) == len(batch_obj_preds)
         num_rel = rels_ind.shape[0]
 
         assert batch_pred_scores_max.shape[0] == num_rel
@@ -102,7 +112,8 @@ def filter_dets(batch_size, boxes, obj_max_scores, obj_classes, rel_inds, pred_s
             rels_ind = rels_ind[:,:2][rel_scores_idx]
 
 
-        out.append((batch_box, batch_obj_cls, batch_obj_scores, rels_ind, gt_rels_ind, batch_pred_scores[rel_scores_idx], batch_obj_preds, p_o_r_m, g_o_r_m, pred_edge_batch, gt_edge_batch))
+        out.append((batch_box, batch_obj_cls, batch_obj_dist if inference else max_batch_obj_scores, batch_attr_dist, rels_ind, gt_rels_ind,
+                    batch_pred_scores[rel_scores_idx], batch_obj_preds, p_o_r_m, g_o_r_m, pred_edge_batch, gt_edge_batch))
 
     return out
     #return boxes_np, objs_np, obj_scores_np, np.asarray(rels_out), np.asarray(pred_scores_out)

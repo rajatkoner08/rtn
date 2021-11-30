@@ -321,4 +321,4 @@ resume_from = None
 workflow = [('train', 1)]
 work_dir = './tmp/detectors_cascade_rcnn_r50_1x_gqa'
 gpu_ids = 0
-ckpt_path = '/nfs/data3/koner/data/checkpoints/neural_motif/motifnet-conf-sgcls/run3_2_gqa_full/vgrel-18.tar'
+ckpt_path = '/nfs/data3/koner/data/checkpoints/mmdet/detectorRS_gqa_full/epoch_8.pth'

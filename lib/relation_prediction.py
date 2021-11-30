@@ -16,6 +16,7 @@ class Relation_Prediction(nn.Module):
 
         self.spo =config.spo
         self.use_gap = config.use_gap #False #to reproduce 163
+        gap_dim = 4096 if config.use_mmdet else 512
         self.use_tanh = config.use_tanh
         self.hidden_dim = config.attn_dim
         self.num_rels = num_rels
@@ -41,7 +42,7 @@ class Relation_Prediction(nn.Module):
             self.ws = Siren(self.hidden_dim, self.hidden_dim)
             self.wo = Siren(self.hidden_dim, self.hidden_dim)
             self.wp = Siren(self.hidden_dim, self.hidden_dim)
-            self.wf = Siren((self.hidden_dim+(128 if self.use_extra_pos else 0) + (512 if self.use_gap else 0)), self.hidden_dim, activation=nn.LeakyReLU())
+            self.wf = Siren((self.hidden_dim+(128 if self.use_extra_pos else 0) + (gap_dim if self.use_gap else 0)), self.hidden_dim, activation=nn.LeakyReLU())
             #self.ln = nn.LayerNorm(self.hidden_dim)
             # #init weight
             # nn.init.xavier_normal_(self.ws.weight)
@@ -50,7 +51,7 @@ class Relation_Prediction(nn.Module):
             # nn.init.xavier_normal_(self.wf.weight)
         else:
 
-            sop_emb_size = self.hidden_dim * 3 + (128 if self.use_extra_pos else 0) + (512 if self.use_gap else 0)
+            sop_emb_size = self.hidden_dim * 3 + (128 if self.use_extra_pos else 0) + (gap_dim if self.use_gap else 0)
             if self.nl_edge > 0 and self.spo == 'spo':  # todo for normalize increase dropout/add layernorm, dropout replace with self.dropout
                 self.sub_obj_emb = nn.Sequential(*[nn.LayerNorm(sop_emb_size),nn.Linear(sop_emb_size, 2*self.hidden_dim),nn.LayerNorm(2*self.hidden_dim),
                                                 nn.Dropout(config.dropout),nn.Linear(2*self.hidden_dim, self.hidden_dim), nn.LeakyReLU()])
@@ -81,17 +82,19 @@ class Relation_Prediction(nn.Module):
 
         #if use of global feats is there
         if self.use_gap:
+            if isinstance(result.fmap, list):
+                result.fmap = result.fmap[0]
             gap_feats = self.avg_pool(result.fmap).view(result.fmap.shape[0], -1)[result.obj_comb[:, 0]]
         else:
-            gap_feats = torch.zeros((0, 0)).cuda()
+            gap_feats = torch.Tensor().cuda(obj_ctx.get_device())
 
         #if use of extra pos is there
         if self.use_extra_pos:
             s_o_emb = self.e_pos_emb(s_o_rois)
             o_s_emb = self.e_pos_emb(o_s_rois)
         else:
-            s_o_emb = torch.Tensor().cuda()
-            o_s_emb = torch.Tensor().cuda()
+            s_o_emb = torch.Tensor().cuda(obj_ctx.get_device())
+            o_s_emb = torch.Tensor().cuda(obj_ctx.get_device())
 
         if self.spo == 'sop':
             fwd_edge_rep = self.ws(obj_ctx[result.obj_comb[:,1]]) * self.wo(obj_ctx[result.obj_comb[:,2]]) * self.wp(edge_ctx)

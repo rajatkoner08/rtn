@@ -539,14 +539,14 @@ class VGDataLoader(torch.utils.data.DataLoader):
     """
 
     @classmethod
-    def splits(cls, train_data, val_data, batch_size=3, num_workers=0, num_gpus=3, mode='det', vg_mini = False, o_val=False,
+    def splits(cls, train_data, val_data, batch_size=3, num_workers=0, num_gpus=3, mode='det', vg_mini = False, o_val=False,shuffle=True,
                **kwargs):
         assert mode in ('det', 'rel')
         sampler = CustomSampler(train_data, vg_mini, o_val)
         train_load = cls(
             dataset=train_data,
             batch_size=batch_size * num_gpus,
-            shuffle=False,
+            shuffle=shuffle,
             num_workers=num_workers,
             collate_fn=lambda x: vg_collate(x, mode=mode, num_gpus=num_gpus, is_train=True),
             drop_last=True,

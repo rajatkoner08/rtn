@@ -34,7 +34,12 @@ def eval_rels(conf, run_mode=None,run_test=False,run_num =None, best_epoch=None)
             raise ValueError()
         checkpt = conf.save_dir+'/run'+str(run_num)+'/vgrel-'+str(best_epoch)+'.tar'
     from lib.context_model import TransformerModel
-
+    if conf.dataset == 'vg':
+        from dataloaders.visual_genome import VGDataLoader, VG
+    elif conf.dataset == 'gqa':
+        from dataloaders.gqa import VGDataLoader, VG
+    else:
+        raise ValueError("Please mention a dataset")
     train, val, test = VG.splits(num_val_im=conf.val_size, filter_duplicate_rels=True,
                               use_proposals=conf.use_proposals,o_valid = conf.o_valid,
                               filter_non_overlap=run_mode == 'sgdet', require_overlap = conf.require_overlap_det)
@@ -48,9 +53,9 @@ def eval_rels(conf, run_mode=None,run_test=False,run_num =None, best_epoch=None)
     detector = TransformerModel(classes=train.ind_to_classes, rel_classes=train.ind_to_predicates, config=conf, filenames= val.filenames )
 
     detector.cuda()
-    ckpt = torch.load(checkpt,map_location='cpu')
+    ckpt = torch.load(checkpt)
 
-    special_case =True #change the weight as per relation predition module
+    special_case =False #change the weight as per relation predition module
     if special_case:
         for n in ckpt['state_dict'].copy().keys():
             if n.startswith(('sub_obj_emb', 'final_rel', 'e_pos_emb')):
@@ -63,18 +68,20 @@ def eval_rels(conf, run_mode=None,run_test=False,run_num =None, best_epoch=None)
     #     detector.detector.bbox_fc.bias.data.copy_(det_ckpt['bbox_fc.bias'])
     #     detector.detector.score_fc.weight.data.copy_(det_ckpt['score_fc.weight'])
     #     detector.detector.score_fc.bias.data.copy_(det_ckpt['score_fc.bias'])
-
+    print('model loaded')
     all_pred_entries = []
 
     def val_batch(batch_num, b, evaluator, row_count, thrs=(20, 50, 100)):
         det_res = detector[b]
         if conf.num_gpus == 1:
             det_res = [det_res]
-        for i, (boxes_i, objs_i, obj_scores_i, rels_i, gt_rels_ind, pred_scores_i, obj_preds, p_o_r_m, g_o_r_m, pred_edge, true_edge) in enumerate(det_res[0]):
+        for i, (boxes_i, objs_i, obj_scores_i, attr_dist, rels_i, gt_rels_ind, pred_scores_i, obj_preds, p_o_r_m, g_o_r_m, pred_edge, true_edge) in enumerate(det_res[0]):
             gt_entry = {
                 'gt_classes': val.gt_classes[batch_num*conf.batch_size + i].copy(),
                 'gt_relations': val.relationships[batch_num*conf.batch_size + i].copy(),
                 'gt_boxes': val.gt_boxes[batch_num*conf.batch_size + i].copy(),
+                'gt_attrs': val.gt_attr[batch_num * conf.batch_size + i][:,
+                            1:].copy() if conf.dataset == 'gqa' else None,
             }
             #assert np.all(objs_i[rels_i[:, 0]] > 0) and np.all(objs_i[rels_i[:, 1]] > 0)  #as it may contain background also
             no_of_gt_class = len(gt_entry['gt_classes'])   #to get rid of padding
@@ -86,6 +93,7 @@ def eval_rels(conf, run_mode=None,run_test=False,run_num =None, best_epoch=None)
                 'pred_rel_inds': rels_i,
                 'gt_rel_inds': gt_rels_ind,
                 'obj_scores': obj_scores_i[:no_of_gt_class],
+                'pred_attrs': attr_dist[:, 1:] if conf.use_attr else None,
                 'rel_scores': pred_scores_i,  # hack for now.
                 'obj_preds': obj_preds[:no_of_gt_class],
                 'p_o_r_m': p_o_r_m,
@@ -142,7 +150,7 @@ def eval_rels(conf, run_mode=None,run_test=False,run_num =None, best_epoch=None)
 
         evaluator[run_mode].print_stats()
         print("Number of rows : ",row_count)
-        #mean_recall = calculate_mR_from_evaluator_list(evaluator_list, run_mode)
+        mean_recall = calculate_mR_from_evaluator_list(evaluator_list, run_mode)
         if conf.multi_pred:
             mean_recall_mp = calculate_mR_from_evaluator_list(evaluator_multiple_preds_list, conf.mode,
                                                                   multiple_preds=conf.multi_pred,
@@ -155,6 +163,6 @@ def eval_rels(conf, run_mode=None,run_test=False,run_num =None, best_epoch=None)
 
 if __name__ == "__main__":
     conf = ModelConfig(file=os.path.join(filepath, 'param.txt'))  # write all param to file
-    for mode in ('predcls','sgcls'):
+    for mode in ('sgcls','predcls'):
         conf.mode=mode
         eval_rels(conf)

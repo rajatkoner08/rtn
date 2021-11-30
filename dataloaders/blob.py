@@ -9,7 +9,7 @@ from torch.autograd import Variable
 
 
 class Blob(object):
-    def __init__(self, mode='det', is_train=False, num_gpus=1, primary_gpu=0, batch_size_per_gpu=3, pad_batch=True):
+    def __init__(self, mode='det', is_train=False, num_gpus=1, primary_gpu=0, batch_size_per_gpu=3, pad_batch=True, dataset='vg'):
         """
         Initializes an empty Blob object.
         :param mode: 'det' for detection and 'rel' for det+relationship
@@ -23,6 +23,7 @@ class Blob(object):
         self.batch_size_per_gpu = batch_size_per_gpu
         self.primary_gpu = primary_gpu
         self.pad_batch = pad_batch
+        self.dataset = dataset
 
         self.imgs = []  # [num_images, 3, IM_SCALE, IM_SCALE] array
         self.im_sizes = []  # [num_images, 4] array of (h, w, scale, num_valid_anchors)
@@ -41,6 +42,7 @@ class Blob(object):
         self.obj_comb_pos = []  # all unique object combination pos
         self.norm_boxes = []  #  [num_gt, 4] boxes that are normalized
         self.obj_rel_mat = []
+        self.gt_attr = []
 
         self.gt_sents = []
         self.gt_nodes = []
@@ -53,6 +55,7 @@ class Blob(object):
 
         self.batch_size = None
         self.gt_box_chunks = None
+        self.gt_attr_chunks = None
         self.anchor_chunks = None
         self.train_chunks = None
         self.obj_rel_mat_chunks = None
@@ -98,6 +101,11 @@ class Blob(object):
             d['gt_classes'],
         )))
 
+        if self.dataset =='gqa':
+            self.gt_attr.append(np.column_stack((
+                i * np.ones(d['gt_attr'].shape[0], dtype=np.int64),
+                d['gt_attr'],
+            )))
         self.obj_rel_mat.append(d['obj_rel_mat'])
 
         #add padding for valid sequences
@@ -109,6 +117,7 @@ class Blob(object):
             self.tgt_seq.append(np.column_stack((
                 i * np.ones(d['tgt_seq'].shape[0], dtype=np.int64),
                 d['tgt_seq'])))
+
 
         # Add relationship info
         if self.is_rel:
@@ -162,7 +171,7 @@ class Blob(object):
         for i in range(self.num_gpus):
             for j in range(self.batch_size_per_gpu):
                 chunk_sizes[i] += datom[i * self.batch_size_per_gpu + j].shape[0]
-        return Variable(tensor(np.concatenate(datom, 0))), chunk_sizes
+        return Variable(tensor(np.concatenate(datom, 0)), volatile=self.volatile), chunk_sizes
 
     def reduce(self):
         """ Merges all the detections into flat lists + numbers of how many are in each"""
@@ -171,9 +180,12 @@ class Blob(object):
                 len(self.imgs), self.batch_size_per_gpu, self.num_gpus
             ))
 
-        self.imgs = Variable(torch.stack(self.imgs, 0))
+        self.imgs = Variable(torch.stack(self.imgs, 0), volatile=self.volatile)
         self.obj_rel_mat = torch.FloatTensor(np.stack(self.obj_rel_mat,0)) # todo use it as like img
         self.im_sizes = np.stack(self.im_sizes).reshape((self.num_gpus, self.batch_size_per_gpu, 3))
+
+        if self.dataset=='gqa':
+            self.gt_attr, self.gt_attr_chunks = self._chunkize(self.gt_attr)
 
         if self.is_rel:
             self.gt_rels, self.gt_rel_chunks = self._chunkize(self.gt_rels)
@@ -215,6 +227,8 @@ class Blob(object):
         self.gt_boxes_primary = self.gt_boxes.cuda(self.primary_gpu, non_blocking=True)
 
         # Predcls might need these
+        if self.dataset=='gqa':
+            self.gt_attr = self._scatter(self.gt_attr, self.gt_attr_chunks)
         self.gt_classes = self._scatter(self.gt_classes, self.gt_box_chunks)
         self.gt_boxes = self._scatter(self.gt_boxes, self.gt_box_chunks)
         self.norm_boxes = self._scatter(self.norm_boxes, self.gt_box_chunks)
@@ -288,8 +302,8 @@ class Blob(object):
             image_offset = 0
             if self.is_train:
                 return (self.imgs, self.im_sizes[0], image_offset,
-                        self.gt_boxes, self.gt_classes, self.src_seq, self.tgt_seq, rels, proposals, self.gt_obj_comb, fwd_rels, inv_rels, self.train_anchor_inds, self.obj_comb_pos, self.norm_boxes, self.obj_rel_mat)
-            return self.imgs, self.im_sizes[0], image_offset, self.gt_boxes, self.gt_classes, self.src_seq, self.tgt_seq, rels, proposals, self.gt_obj_comb, fwd_rels, inv_rels, None, self.obj_comb_pos, self.norm_boxes, self.obj_rel_mat
+                        self.gt_boxes, self.gt_classes, self.src_seq, self.tgt_seq, rels, proposals, self.gt_obj_comb, fwd_rels, inv_rels, self.train_anchor_inds, self.obj_comb_pos, self.norm_boxes, self.obj_rel_mat, self.gt_attr)
+            return self.imgs, self.im_sizes[0], image_offset, self.gt_boxes, self.gt_classes, self.src_seq, self.tgt_seq, rels, proposals, self.gt_obj_comb, fwd_rels, inv_rels, None, self.obj_comb_pos, self.norm_boxes, self.obj_rel_mat, self.gt_attr
 
         # Otherwise proposals is None
         assert proposals is None
@@ -299,7 +313,7 @@ class Blob(object):
         if self.is_train:
             return (
             self.imgs[index], self.im_sizes[index], image_offset,
-            self.gt_boxes[index], self.gt_classes[index], self.src_seq[index], self.tgt_seq[index], rels_i[index], None, self.gt_obj_comb[index], fwd_rels_i[index], inv_rels_i[index], self.train_anchor_inds[index], self.obj_comb_pos[index], self.norm_boxes[index], self.obj_rel_mat[index])
+            self.gt_boxes[index], self.gt_classes[index], self.src_seq[index], self.tgt_seq[index], rels_i[index], None, self.gt_obj_comb[index], fwd_rels_i[index], inv_rels_i[index], self.train_anchor_inds[index], self.obj_comb_pos[index], self.norm_boxes[index], self.obj_rel_mat[index], self.gt_attr[index])
         return (self.imgs[index], self.im_sizes[index], image_offset,
-                self.gt_boxes[index], self.gt_classes[index], self.src_seq[index], self.tgt_seq[index], rels_i[index], None, self.gt_obj_comb[index], fwd_rels_i[index], inv_rels_i[index], None, self.obj_comb_pos[index], self.norm_boxes[index],self.obj_rel_mat[index])
+                self.gt_boxes[index], self.gt_classes[index], self.src_seq[index], self.tgt_seq[index], rels_i[index], None, self.gt_obj_comb[index], fwd_rels_i[index], inv_rels_i[index], None, self.obj_comb_pos[index], self.norm_boxes[index],self.obj_rel_mat[index], self.gt_attr[index])
 

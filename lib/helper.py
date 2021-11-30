@@ -1,7 +1,7 @@
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from lib.fpn.box_utils import center_size,point_form
-font = ImageFont.load_default()
+font = ImageFont.load_default() #ImageFont.truetype('/usr/share/fonts/truetype/freefont/FreeMonoBold.ttf', 16)
 import torch
 import random
 import os
@@ -121,7 +121,7 @@ def get_params(conf, detector, lr, show_name =True):
         n_non_fc_params = []
         for n, param in detector.named_parameters():
             if param.requires_grad:
-                if n.startswith('detector') and conf.train_detector:
+                if n.startswith(('detector','roi_extractor')) and conf.train_detector:
                     if conf.reduce_lr:
                         fc_params.append(param)
                         n_fc_params.append(n)
@@ -130,7 +130,7 @@ def get_params(conf, detector, lr, show_name =True):
                         n_non_fc_params.append(n)
 
                 if (n.startswith(('roi_fmap_obj', 'context.decoder_lin'))) and conf.train_obj_roi: #'roi_fmap' todo use normal lr for edge
-                    if conf.reduce_lr:
+                    if conf.reduce_lr and conf.dataset=='vg':
                         fc_params.append(param)
                         n_fc_params.append(n)
                     else:
@@ -145,14 +145,15 @@ def get_params(conf, detector, lr, show_name =True):
                             non_fc_params.append(param)
                             n_non_fc_params.append(n)
 
-                if not (n.startswith(('roi_fmap_obj', 'context.decoder_lin', 'context.pos_embed.0', 'context.pos_embed.1', 'context.obj_ctx_enc', 'context.compress_node', 'detector'))):  #for edge, sub_ob_emb, final emb
+                if not (n.startswith(('roi_fmap_obj', 'context.decoder_lin', 'context.pos_embed.0', 'context.pos_embed.1', 'context.obj_ctx_enc', 'context.compress_node', 'detector', 'roi_extractor'))):  #for edge, sub_ob_emb, final emb
                     non_fc_params.append(param)
                     n_non_fc_params.append(n)
 
         params = [{'params': fc_params, 'lr': lr / 10.0}, {'params': non_fc_params}]
         if show_name:
             print('Reduced lr : ',n_fc_params)
-            print('Not reduced lr : ',n_non_fc_params)
+            print('Not reduced lr : ')
+            [print(name) for name in n_non_fc_params]
     else:
         params = [p for n, p in detector.named_parameters() if p.requires_grad]
 

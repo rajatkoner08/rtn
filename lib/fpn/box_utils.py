@@ -251,3 +251,32 @@ def draw_obj_box(boxes, classes=None, pooling_size=27, box_seq=None):
     if tensor:
        return torch.from_numpy(numeric_boxes).cuda().float()
     return numeric_boxes
+
+
+def increase_relative_size(pred_boxes, width, height, relative_per):
+    """
+    increase the size of boxes by relative per for local relation
+    :param pred_boxes:
+    :param width:
+    :param height:
+    :param relative_per:
+    :return:
+    """
+    # increase boxes relative to img that near around image
+    boxes = center_size(pred_boxes)
+
+    #  todo later :dont increse those boxes which are already very large
+
+    #increase the width and height
+    w = boxes[:, 2] + (width*relative_per)
+    h = boxes[:, 3] + (height*relative_per)
+
+    wh = np.column_stack((w,h))
+    boxes =  np.column_stack((boxes[:, :2] - 0.5 * wh, boxes[:, :2] + 0.5 * wh))
+
+    # now clip out of range values
+    boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, height)
+    boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, width)
+
+    return boxes
+

@@ -6,8 +6,9 @@ import torch
 from torch.autograd import Variable
 from torch.nn import functional as F
 from lib.fpn.box_utils import normalized_boxes, union_boxes
-from lib.fpn.roi_align.functions.roi_align import RoIAlignFunction
-#from torchvision.ops.roi_align import roi_align as RoIAlignFunction
+
+#from lib.fpn.roi_align_unnormalized.functions.roi_align import RoIAlignFunction
+from torchvision.ops.roi_align import roi_align as RoIAlignFunction
 from lib.draw_rectangles.draw_rectangles import draw_union_boxes
 import numpy as np
 from torch.nn.modules.module import Module
@@ -15,7 +16,8 @@ from torch import nn
 from config import BATCHNORM_MOMENTUM
 
 class UnionBoxesAndFeats(Module):
-    def __init__(self, pooling_size=7, stride=16, dim=256, batch_size=4, concat=False, use_uimg_feats=True, fwd_dim = 2048):
+    def __init__(self, pooling_size=7, stride=16, dim=256, batch_size=4, concat=False, use_uimg_feats=True, fwd_dim = 2048, pool_dim= 4096,
+                 mmdet=False, roi_extractor= None, roi_fmap=None):
         """
         :param pooling_size: Pool the union boxes to this dimension
         :param stride: pixel spacing in the entire image
@@ -28,41 +30,49 @@ class UnionBoxesAndFeats(Module):
         self.stride = stride
         self.batch_size = batch_size
         self.concat = concat
+        self.pool_dim = pool_dim
+        self.mmdet =  mmdet
 
         self.dim = dim
         self.use_feats = use_uimg_feats
+        stride = [2,2] if self.mmdet else [2,1]
+
 
         self.conv = nn.Sequential(
-            nn.Conv2d(2, dim//2, kernel_size=7, stride=2, padding=3, bias=True),
+            nn.Conv2d(2, dim//2, kernel_size=7, stride=stride[0], padding=3, bias=True),
             nn.ReLU(inplace=True),
             nn.BatchNorm2d(dim//2, momentum=BATCHNORM_MOMENTUM),
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            nn.Conv2d(dim//2, dim, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.Conv2d(dim//2, dim, kernel_size=3, stride=stride[1], padding=1, bias=True),
             nn.ReLU(inplace=True),
             nn.BatchNorm2d(dim, momentum=BATCHNORM_MOMENTUM),
         );
 
         if not self.use_feats: #insted here this can be moved to context model itself
             self.box_draw_feats = nn.Sequential(nn.Linear(dim*7*7, fwd_dim),nn.BatchNorm1d(fwd_dim, momentum=BATCHNORM_MOMENTUM),nn.ReLU(inplace=True),nn.Linear(fwd_dim,fwd_dim), nn.Dropout(0.5))
-        # self.concat = concat
 
+        self.roi_extractor = roi_extractor
+        self.roi_fmap = roi_fmap
     def forward(self, fmap, rois, union_inds, use_norm_boxes, im_sizes, tgt_seq=None):
 
         u_rois, rel_boxes = union_boxes(rois, union_inds)
         if tgt_seq is not None :  # set zero to all the bogus values
             u_rois[:, 1:] *= (tgt_seq[:, 1][:, None]).float()
             rel_boxes[:, 1:] *= (tgt_seq[:, 1][:, None]).float()
-        # union_pools = RoIAlignFunction(fmap, u_rois,
-        #                                 output_size=[self.pooling_size, self.pooling_size], spatial_scale=1 / 16, sampling_ratio= 0)
-        union_pools = RoIAlignFunction(self.pooling_size, self.pooling_size,
-                                       spatial_scale=1 / self.stride)(fmap, u_rois)
+
+
         pair_rois = torch.cat((rois[:, 1:][union_inds[:, 1]], rois[:, 1:][union_inds[:, 2]]), 1).data.cpu().numpy()
         rects_np = draw_union_boxes(pair_rois, u_rois[:,1:].data.cpu().numpy(), tgt_seq.data.cpu().numpy().astype(np.float32), self.pooling_size * 4 - 1) - 0.5
-        rects = self.conv(torch.FloatTensor(rects_np).cuda(fmap.get_device())) #[:,0,:,:]).unsqueeze(1
-
+        rects = self.conv(torch.FloatTensor(rects_np).cuda(u_rois.get_device()))
+        #now get the union box and box feats
+        if  self.mmdet:
+            union_pools = self.roi_fmap(self.roi_extractor(fmap, u_rois))
+        else:
+            union_pools = RoIAlignFunction(fmap, u_rois,output_size=[self.pooling_size, self.pooling_size], spatial_scale=1 / 16,
+                                           sampling_ratio=0)
+        union_pools  =  union_pools.view(union_pools.shape[0],-1)
         if self.use_feats:
-            # (num_rois, d, pooling_size, pooling_size)
-            union_pools += rects
+             combined_union_pools = union_pools + rects.view(rects.shape[0],-1)
 
         if use_norm_boxes:
             widths = torch.cuda.FloatTensor(
@@ -75,7 +85,7 @@ class UnionBoxesAndFeats(Module):
             u_rois = torch.cat((u_rois, rel_boxes),1)
 
         if self.use_feats:
-            return union_pools.detach(), u_rois, rel_boxes[:,:4], rel_boxes[:,4:]
+            return combined_union_pools, u_rois, rel_boxes[:,:4], rel_boxes[:,4:]
         else:
             return  self.box_draw_feats(rects.view(rects.size(0), -1)), u_rois, rel_boxes[:,:4], rel_boxes[:,4:]
 

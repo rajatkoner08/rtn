@@ -8,36 +8,37 @@ from torch.nn import functional as F
 from config import ANCHOR_SIZE, ANCHOR_RATIOS, ANCHOR_SCALES
 from lib.fpn.generate_anchors import generate_anchors
 from lib.fpn.box_utils import bbox_preds, center_size, bbox_overlaps
-from lib.fpn.nms.functions.nms import apply_nms
-#from torchvision.ops.boxes import batched_nms as apply_nms
+from torchvision.ops.boxes import batched_nms as apply_nms
 from lib.fpn.proposal_assignments.proposal_assignments_gtbox import proposal_assignments_gtbox
 from lib.fpn.proposal_assignments.proposal_assignments_det import proposal_assignments_det
 
-from lib.fpn.roi_align.functions.roi_align import RoIAlignFunction
-#from roi_align import RoIAlignFunction
-#from torchvision.ops.roi_align import roi_align as RoIAlignFunction
+from torchvision.ops.roi_align import roi_align as RoIAlignFunction
 from lib.pytorch_misc import enumerate_by_image, gather_nd, diagonal_inds, Flattener
 from torchvision.models.vgg import vgg16
 from torchvision.models.resnet import resnet101
 from torch.nn.parallel._functions import Gather
+from lib.detection_models import load_mmdetection
 
 
 class Result(object):
     """ little container class for holding the detection result
         od: object detector, rm: rel model"""
 
-    def __init__(self, od_obj_dists=None, rm_obj_dists=None,
+    def __init__(self, od_obj_dists=None, rm_obj_dists=None,od_attr_dist =None,
                  obj_scores=None, obj_preds=None, obj_fmap=None,
-                 od_box_deltas=None, rm_box_deltas=None,
+                 od_box_deltas=None, rm_box_deltas=None, od_attrs = None,
                  od_box_targets=None, rm_box_targets=None, od_box_priors=None, rm_box_priors=None,
                  boxes_assigned=None, boxes_all=None, od_obj_labels=None, rm_obj_labels=None,
-                 rpn_scores=None, rpn_box_deltas=None, rel_labels=None,
-                 im_inds=None, fmap=None, rel_dists=None, rel_inds=None, rel_rep=None, obj_comb=None):
+                 rpn_scores=None, rpn_box_deltas=None, rel_labels=None, im_inds=None,
+                 fmap=None, rel_dists=None, rel_inds=None, rel_rep=None, obj_comb=None, attr_dist=None):
         self.__dict__.update(locals())
         del self.__dict__['self']
 
     def is_none(self):
         return all([v is None for k, v in self.__dict__.items() if k != 'self'])
+
+    def is_nan(self):
+        return any([torch.isnan(v).any() for k, v in self.__dict__.items() if k != 'self' and torch.is_tensor(v)])
 
 
 def gather_res(outputs, target_device, dim=0):
@@ -58,7 +59,7 @@ class ObjectDetector(nn.Module):
     MODES = ('rpntrain', 'gtbox', 'refinerels', 'proposals')
 
     def __init__(self, classes, mode='rpntrain', num_gpus=1, nms_filter_duplicates=True,
-                 max_per_img=64, use_resnet=False, thresh=0.05):
+                 max_per_img=64, use_resnet=False, thresh=0.05, use_mmdet=True, mmdet_config=None, mmdet_ckpt=None):
         """
         :param classes: Object classes
         :param rel_classes: Relationship classes. None if were not using rel mode
@@ -76,9 +77,14 @@ class ObjectDetector(nn.Module):
         self.nms_filter_duplicates = nms_filter_duplicates
         self.max_per_img = max_per_img
         self.use_resnet = use_resnet
+        self.use_mmdet = use_mmdet
         self.thresh = thresh
 
-        if not self.use_resnet:
+        if self.use_mmdet:
+            self.features, self.roi_fmap  = load_mmdetection(config_file=mmdet_config, ckpt_path=mmdet_ckpt)
+            rpn_input_dim = 256
+            output_dim = 1024
+        elif not self.use_resnet:
             vgg_model = load_vgg()
             self.features = vgg_model.features
             self.roi_fmap = vgg_model.classifier
@@ -104,7 +110,7 @@ class ObjectDetector(nn.Module):
 
         self.score_fc = nn.Linear(output_dim, self.num_classes)
         self.bbox_fc = nn.Linear(output_dim, self.num_classes * 4)
-        self.rpn_head = RPNHead(dim=512, input_dim=rpn_input_dim)
+        self.rpn_head = RPNHead(dim=256 if self.use_mmdet else 512, input_dim=rpn_input_dim)
 
     @property
     def num_classes(self):
@@ -129,17 +135,17 @@ class ObjectDetector(nn.Module):
         c4 = self.features.layer3(c3)
         return c4
 
-    def obj_feature_map(self, features, rois):
+    def obj_feature_map(self, features, rois, im_sizes=None):
         """
         Gets the ROI features
         :param features: [batch_size, dim, IM_SIZE/4, IM_SIZE/4] (features at level p2)
         :param rois: [num_rois, 5] array of [img_num, x0, y0, x1, y1].
         :return: [num_rois, #dim] array
         """
-        # feature_pool = RoIAlignFunction(self.compress(features) if self.use_resnet else features, rois,
-        #                                 output_size=[self.pooling_size, self.pooling_size], spatial_scale=1 / 16, sampling_ratio=0)
-        feature_pool = RoIAlignFunction(self.pooling_size, self.pooling_size, spatial_scale=1 / 16)(
-            self.compress(features) if self.use_resnet else features, rois)
+        if self.use_mmdet:
+            return self.roi_fmap(features, rois.detach(), True)
+        feature_pool = RoIAlignFunction(self.compress(features) if self.use_resnet else features, rois,
+                                        output_size=[self.pooling_size, self.pooling_size], spatial_scale=1 / 16, sampling_ratio=0)
         return self.roi_fmap(feature_pool.view(rois.size(0), -1))
 
     def rpn_boxes(self, fmap, im_sizes, image_offset, gt_boxes=None, gt_classes=None, gt_rels=None,
@@ -156,6 +162,8 @@ class ObjectDetector(nn.Module):
         :param gt_obj_comb: is not used in sgdet
         :return:
         """
+        if isinstance(fmap, list):
+            fmap=fmap[0]
         rpn_feats = self.rpn_head(fmap)
         rois = self.rpn_head.roi_proposals(
             rpn_feats, im_sizes, nms_thresh=0.7,
@@ -314,10 +322,15 @@ class ObjectDetector(nn.Module):
             obj_comb = gt_obj_comb
 
         # Now classify them
-        obj_fmap = self.obj_feature_map(fmap, rois)
-        od_obj_dists = self.score_fc(obj_fmap)
-        od_box_deltas = self.bbox_fc(obj_fmap).view(
-            -1, len(self.classes), 4) if self.mode != 'gtbox' else None
+        if self.use_mmdet:
+            od_attr_dist= None
+            obj_fmap, od_obj_dists = self.obj_feature_map(fmap, rois, im_sizes) # todo for non attibute turn it off
+            od_box_deltas = None
+        else:
+            obj_fmap = self.obj_feature_map(fmap, rois)
+            od_obj_dists = self.score_fc(obj_fmap)
+            od_box_deltas = self.bbox_fc(obj_fmap).view(
+                -1, len(self.classes), 4) if self.mode != 'gtbox' else None
 
         od_box_priors = rois[:, 1:]
 
@@ -378,6 +391,7 @@ class ObjectDetector(nn.Module):
             im_inds=im_inds,
             obj_comb=obj_comb,
             fmap=fmap if return_fmap else None,
+            od_attr_dist= od_attr_dist,
         )
 
     def nms_boxes(self, obj_dists, rois, box_deltas, im_sizes):
